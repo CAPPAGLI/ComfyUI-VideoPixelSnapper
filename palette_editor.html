@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Palette &amp; Frame Editor — companion for Video Pixel Snapper</title>
+<style>
+  :root{
+    --bg: #14161a;
+    --panel: #1b1e24;
+    --panel-2: #22262e;
+    --line: #2c313a;
+    --text: #e8e6df;
+    --text-dim: #8b909c;
+    --accent: #e0a458;
+    --accent-2: #5fb3a3;
+    --danger: #d9695f;
+    --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--text);
+    font-family: var(--mono); height:100%; }
+  #app { display:grid; grid-template-columns: 1fr 320px; grid-template-rows: auto 1fr; height:100vh; }
+  header {
+    grid-column: 1 / 3; padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display:flex; align-items:baseline; gap:14px; background: var(--panel);
+  }
+  header h1 { font-size: 14px; letter-spacing: 0.06em; text-transform: uppercase; margin:0; color: var(--accent); font-weight:600;}
+  header p { margin:0; font-size:12px; color: var(--text-dim); }
+
+  #stage { position:relative; overflow:hidden; touch-action:none;
+    background:
+      linear-gradient(45deg, #20232a 25%, transparent 25%),
+      linear-gradient(-45deg, #20232a 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #20232a 75%),
+      linear-gradient(-45deg, transparent 75%, #20232a 75%);
+    background-size: 20px 20px;
+    background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+    background-color: #17191d;
+  }
+  #viewport { position:absolute; top:0; left:0; transform-origin: 0 0; will-change: transform; }
+  #frameCanvas { image-rendering: pixelated; image-rendering: crisp-edges; display:block; }
+  #dropHint { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:10px; color:var(--text-dim); font-size:13px; text-align:center; padding:40px;
+    pointer-events:none; }
+  #dropHint b { color: var(--text); }
+
+  aside { border-left: 1px solid var(--line); background: var(--panel); display:flex; flex-direction:column;
+    overflow-y:auto; }
+  .section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .section h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); margin: 0 0 10px 0; }
+
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  button {
+    font-family: var(--mono); font-size: 12px; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: 7px 10px; cursor:pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); color: #1a1508; border-color: var(--accent); font-weight:600; }
+  button.primary:hover { filter: brightness(1.08); color:#1a1508; }
+  button.danger:hover { border-color: var(--danger); color: var(--danger); }
+  button:disabled { opacity:0.35; cursor:default; }
+  button:disabled:hover { border-color: var(--line); color: var(--text); }
+  input[type=file] { display:none; }
+  label.filebtn { font-family: var(--mono); font-size: 12px; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: 7px 10px; cursor:pointer; display:inline-block; }
+  label.filebtn:hover { border-color: var(--accent); color: var(--accent); }
+
+  #paletteGrid { display:grid; grid-template-columns: repeat(6, 1fr); gap:8px; margin-top:10px; }
+  .swatch { position:relative; aspect-ratio: 1; border-radius:4px; cursor:pointer; }
+  .swatch.selected { box-shadow: 0 0 0 2px #0a0b0d, 0 0 0 4px #f4f1ea; }
+  .swatch.protected::after {
+    content: "★"; position:absolute; top:-7px; right:-7px; font-size:10px; color: var(--accent);
+    text-shadow: 0 0 2px #000, 0 0 2px #000;
+  }
+  .swatch .del {
+    position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+    background: rgba(20,22,26,0.78); color: var(--danger); font-size:14px; border-radius:3px;
+  }
+  .swatch:hover .del { display:flex; }
+  #paletteEmpty { color: var(--text-dim); font-size:12px; margin-top:8px; }
+  #paletteMeta { color: var(--text-dim); font-size: 11px; margin-top: 8px; }
+
+  #frameStrip { display:flex; gap:6px; overflow-x:auto; padding: 10px 16px; border-bottom:1px solid var(--line); }
+  #frameStrip .thumb { width:48px; height:48px; flex:0 0 auto; border-radius:4px; border:2px solid var(--line);
+    background-size:cover; background-position:center; cursor:pointer; image-rendering:pixelated; }
+  #frameStrip .thumb.active { border-color: var(--accent); }
+
+  #frameCounter { display:inline-block; min-width: 60px; text-align:center; font-size:12px;
+    color:var(--text-dim); font-variant-numeric: tabular-nums; }
+
+  .tool-toggle { display:flex; gap:0; border:1px solid var(--line); border-radius:4px; overflow:hidden; }
+  .tool-toggle button { border:none; border-radius:0; flex:1; }
+  .tool-toggle button.active { background: var(--accent-2); color:#0d1a17; }
+
+  #pickPreview { display:none; margin-top:10px; align-items:center; gap:8px; }
+  #pickSwatch { width:22px; height:22px; border-radius:4px; border:1px solid var(--line); flex:0 0 auto; }
+  #pickStatus { font-size:11px; }
+
+  .hint { font-size:11px; color: var(--text-dim); line-height:1.5; margin-top:8px; }
+  .zoom-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
+  .zoom-row input[type=range] { flex:1; }
+  footer.section { margin-top:auto; }
+
+  .overlay { position:fixed; inset:0; background: rgba(10,11,13,0.92); z-index:100;
+    display:flex; flex-direction:column; }
+  .overlay.hidden { display:none; }
+  .overlay-bar { display:flex; align-items:center; justify-content:space-between; padding:12px 20px;
+    border-bottom:1px solid var(--line); background:var(--panel); }
+  .overlay-bar select { font-family:var(--mono); font-size:12px; background:var(--panel-2); color:var(--text);
+    border:1px solid var(--line); border-radius:4px; padding:6px 8px; }
+  #compareStage { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:20px; }
+  #compareBox { position:relative; width:min(90vw, 900px); height:min(70vh, 640px);
+    background:
+      linear-gradient(45deg, #20232a 25%, transparent 25%),
+      linear-gradient(-45deg, #20232a 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #20232a 75%),
+      linear-gradient(-45deg, transparent 75%, #20232a 75%);
+    background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; background-color:#17191d;
+    border:1px solid var(--line); border-radius:6px; overflow:hidden; cursor:ew-resize; touch-action:none; }
+  #compareBox canvas { position:absolute; inset:0; width:100%; height:100%; image-rendering:pixelated; }
+  #compareHandle { position:absolute; top:0; bottom:0; width:2px; background:var(--accent);
+    left:50%; transform:translateX(-1px); pointer-events:none; }
+  #compareHandle::before { content:""; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    width:22px; height:22px; border-radius:50%; background:var(--accent); }
+  #compareLabels { display:flex; justify-content:space-between; width:min(90vw, 900px); font-size:11px; color:var(--text-dim); }
+  #compareMsg { color: var(--text-dim); font-size:12px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Palette &amp; Frame Editor</h1>
+    <p>Компаньон для Video Pixel Snapper — редактирование палитры, ручная правка кадров, сравнение было/стало</p>
+  </header>
+
+  <div id="stage">
+    <div id="dropHint">
+      <div><b>Загрузи кадры</b>, чтобы начать: перетащи PNG/JPG сюда,<br>используй «Загрузить кадры» или «Загрузить папку» справа.</div>
+      <div>Отдельно можно загрузить <b>палитру</b> (например, выход palette_preview из ноды) через «Загрузить палитру».</div>
+    </div>
+    <div id="viewport">
+      <canvas id="frameCanvas"></canvas>
+    </div>
+  </div>
+
+  <aside>
+    <div id="frameStrip"></div>
+
+    <div class="section">
+      <h2>Кадры</h2>
+      <div class="row">
+        <label class="filebtn">Загрузить кадры<input type="file" id="frameInput" accept="image/*" multiple></label>
+        <button id="loadFolder">Загрузить папку</button>
+        <button id="clearFrames" class="danger">Очистить кадры</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <button id="prevFrame">&larr;</button>
+        <span id="frameCounter">—</span>
+        <button id="nextFrame">&rarr;</button>
+      </div>
+      <div class="zoom-row">
+        <span style="font-size:11px;color:var(--text-dim);">zoom</span>
+        <input type="range" id="zoomRange" min="1" max="32" value="8">
+        <span id="zoomLabel" style="font-size:11px;color:var(--text-dim);">8x</span>
+      </div>
+      <div class="hint">Колесо мыши — панорама в любую сторону, даже за пределы того, что было видно раньше.
+        Ctrl/Cmd + колесо — зум под курсором. Инструмент Pan (или средняя кнопка мыши) — панорама перетаскиванием.</div>
+    </div>
+
+    <div class="section">
+      <h2>Палитра</h2>
+      <div class="row">
+        <label class="filebtn">Загрузить палитру<input type="file" id="paletteInput" accept="image/*"></label>
+        <button id="extractFromFrame">Извлечь из кадра</button>
+        <button id="clearPalette" class="danger">Очистить палитру</button>
+      </div>
+      <div id="paletteGrid"></div>
+      <div id="paletteEmpty">Палитра пуста — загрузи её или извлеки из текущего кадра.</div>
+      <div id="paletteMeta"></div>
+      <div class="row" style="margin-top:10px;">
+        <button id="exportPalette" class="primary">Экспорт палитры PNG</button>
+      </div>
+      <div class="hint">Клик по свотчу — выбрать цвет для рисования. Shift+клик — пометить как акцентный
+        (только для тебя, на экспорт не влияет). Крестик при наведении — удалить неудачный/лишний полутон.</div>
+    </div>
+
+    <div class="section">
+      <h2>Инструмент</h2>
+      <div class="tool-toggle">
+        <button id="toolPaint" class="active">Paint</button>
+        <button id="toolPick">Pick</button>
+        <button id="toolPan">Pan</button>
+      </div>
+      <div id="pickPreview">
+        <div id="pickSwatch"></div>
+        <span id="pickStatus"></span>
+      </div>
+      <div class="hint">Paint — рисовать выбранным цветом по клику/протяжке (снаппится на пиксельную сетку кадра).
+        Pick — навести, чтобы увидеть цвет под курсором (окошко выше) и есть ли он уже в палитре; клик — взять его.
+        Pan — панорама перетаскиванием.</div>
+    </div>
+
+    <div class="section">
+      <h2>Сравнение было/стало</h2>
+      <div class="row">
+        <label class="filebtn">Исходный кадр<input type="file" id="rawInput" accept="image/*"></label>
+        <button id="openCompare">Открыть сравнение</button>
+      </div>
+      <div class="hint">Исходный кадр — тот же кадр видео до обработки Pixel Snapper, для сравнения. Раздел
+        «стало с новой палитрой» пересчитывается вживую по текущей палитре слева.</div>
+    </div>
+
+    <footer class="section">
+      <div class="row">
+        <button id="exportFrame" class="primary">Экспорт кадра PNG</button>
+        <button id="resetFrame" class="danger">Сбросить правки кадра</button>
+      </div>
+      <div class="hint">Правки кадра хранятся только в этой вкладке — экспортируй, когда закончишь.</div>
+    </footer>
+  </aside>
+</div>
+
+<div id="compareOverlay" class="overlay hidden">
+  <div class="overlay-bar">
+    <select id="comparePairSelect">
+      <option value="raw_snapped">Исходник vs Обработанный</option>
+      <option value="snapped_recolored" selected>Обработанный vs С новой палитрой</option>
+      <option value="raw_recolored">Исходник vs С новой палитрой</option>
+    </select>
+    <button id="closeCompare">Закрыть ✕</button>
+  </div>
+  <div id="compareStage">
+    <div id="compareBox">
+      <canvas id="compareBottom"></canvas>
+      <canvas id="compareTop"></canvas>
+      <div id="compareHandle"></div>
+    </div>
+    <div id="compareLabels"><span id="labelLeft"></span><span id="labelRight"></span></div>
+    <div id="compareMsg"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------
+  const state = {
+    frames: [],           // [{ name, img, w, h, canvas, ctx }]
+    currentFrame: -1,
+    palette: [],           // [{ hex, protected }]
+    selectedSwatch: -1,
+    tool: "paint",
+    rawFrame: null,        // { canvas, w, h }
+    compareOpen: false,
+  };
+  const view = { panX: 0, panY: 0, zoom: 8 };
+
+  const el = (id) => document.getElementById(id);
+  const frameCanvas = el("frameCanvas");
+  const fctx = frameCanvas.getContext("2d", { willReadFrequently: true });
+  const viewport = el("viewport");
+  const stage = el("stage");
+  const dropHint = el("dropHint");
+
+  // ---------------------------------------------------------------
+  // Pan / zoom (CSS-transform based, not native scroll — native
+  // overflow:scroll + centered flex content can make edges of a
+  // zoomed image permanently unreachable; this avoids that entirely)
+  // ---------------------------------------------------------------
+  function applyTransform() {
+    viewport.style.transform = `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`;
+  }
+
+  function clampPan() {
+    const f = state.frames[state.currentFrame];
+    if (!f) return;
+    const rect = stage.getBoundingClientRect();
+    const contentW = f.w * view.zoom, contentH = f.h * view.zoom;
+    const margin = 60; // always keep at least this many px of the image reachable/visible
+    const centerX = (rect.width - contentW) / 2;
+    const centerY = (rect.height - contentH) / 2;
+    const minPanX = Math.min(margin - contentW, centerX);
+    const maxPanX = Math.max(rect.width - margin, centerX);
+    const minPanY = Math.min(margin - contentH, centerY);
+    const maxPanY = Math.max(rect.height - margin, centerY);
+    view.panX = Math.min(maxPanX, Math.max(minPanX, view.panX));
+    view.panY = Math.min(maxPanY, Math.max(minPanY, view.panY));
+  }
+
+  function centerView() {
+    const f = state.frames[state.currentFrame];
+    if (!f) return;
+    const rect = stage.getBoundingClientRect();
+    view.panX = (rect.width - f.w * view.zoom) / 2;
+    view.panY = (rect.height - f.h * view.zoom) / 2;
+  }
+
+  // ---------------------------------------------------------------
+  // Frame loading
+  // ---------------------------------------------------------------
+  function loadImageFile(file) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  async function addFrames(fileList) {
+    const files = Array.from(fileList).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    for (const file of files) {
+      const img = await loadImageFile(file);
+      const c = document.createElement("canvas");
+      c.width = img.naturalWidth;
+      c.height = img.naturalHeight;
+      const cctx = c.getContext("2d", { willReadFrequently: true });
+      cctx.imageSmoothingEnabled = false;
+      cctx.drawImage(img, 0, 0);
+      state.frames.push({ name: file.name, img, w: img.naturalWidth, h: img.naturalHeight, canvas: c, ctx: cctx });
+    }
+    if (state.currentFrame === -1 && state.frames.length) { state.currentFrame = 0; centerView(); }
+    renderFrameStrip();
+    renderCurrentFrame();
+  }
+
+  function switchToFrame(i) {
+    if (i < 0 || i >= state.frames.length) return;
+    state.currentFrame = i;
+    centerView();
+    renderFrameStrip();
+    renderCurrentFrame();
+    if (state.compareOpen) renderCompare();
+  }
+
+  function renderFrameStrip() {
+    const strip = el("frameStrip");
+    strip.innerHTML = "";
+    state.frames.forEach((f, i) => {
+      const d = document.createElement("div");
+      d.className = "thumb" + (i === state.currentFrame ? " active" : "");
+      d.style.backgroundImage = `url(${f.canvas.toDataURL()})`;
+      d.title = f.name;
+      d.addEventListener("click", () => switchToFrame(i));
+      strip.appendChild(d);
+    });
+    el("frameCounter").textContent = state.frames.length
+      ? `${state.currentFrame + 1} / ${state.frames.length}`
+      : "—";
+  }
+
+  function renderCurrentFrame() {
+    const f = state.frames[state.currentFrame];
+    if (!f) { viewport.style.display = "none"; dropHint.style.display = "flex"; return; }
+    dropHint.style.display = "none";
+    viewport.style.display = "block";
+    frameCanvas.width = f.w;
+    frameCanvas.height = f.h;
+    fctx.imageSmoothingEnabled = false;
+    fctx.clearRect(0, 0, f.w, f.h);
+    fctx.drawImage(f.canvas, 0, 0);
+    clampPan();
+    applyTransform();
+  }
+
+  function renderFrameStripThumbAt(i) {
+    const strip = el("frameStrip");
+    const thumb = strip.children[i];
+    if (thumb) thumb.style.backgroundImage = `url(${state.frames[i].canvas.toDataURL()})`;
+  }
+
+  // ---------------------------------------------------------------
+  // Palette
+  // ---------------------------------------------------------------
+  function rgbToHex(r, g, b) {
+    return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
+  }
+  function hexToRgb(hex) {
+    const v = parseInt(hex.replace("#", ""), 16);
+    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+  }
+
+  function setPalette(colors) {
+    state.palette = colors.map((hex) => ({ hex, protected: false }));
+    state.selectedSwatch = state.palette.length ? 0 : -1;
+    renderPalette();
+  }
+
+  async function extractPaletteFromImage(img) {
+    const c = document.createElement("canvas");
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    const cctx = c.getContext("2d", { willReadFrequently: true });
+    cctx.drawImage(img, 0, 0);
+    const { width, height } = c;
+    const seen = new Map();
+    const stepX = Math.max(1, Math.floor(width / 200));
+    const stepY = Math.max(1, Math.floor(height / 200));
+    for (let y = 0; y < height; y += stepY) {
+      const row = cctx.getImageData(0, y, width, 1).data;
+      for (let x = 0; x < width; x += stepX) {
+        const i = x * 4;
+        if (row[i + 3] < 8) continue;
+        const hex = rgbToHex(row[i], row[i + 1], row[i + 2]);
+        seen.set(hex, (seen.get(hex) || 0) + 1);
+      }
+    }
+    const sorted = Array.from(seen.entries()).sort((a, b) => b[1] - a[1]);
+    return sorted.slice(0, 64).map(([hex]) => hex);
+  }
+
+  function renderPalette() {
+    const grid = el("paletteGrid");
+    grid.innerHTML = "";
+    el("paletteEmpty").style.display = state.palette.length ? "none" : "block";
+    state.palette.forEach((sw, i) => {
+      const d = document.createElement("div");
+      d.className = "swatch" + (i === state.selectedSwatch ? " selected" : "") + (sw.protected ? " protected" : "");
+      d.style.background = sw.hex;
+      d.title = sw.hex + (sw.protected ? " (accent)" : "");
+      d.addEventListener("click", (e) => {
+        if (e.shiftKey) { sw.protected = !sw.protected; renderPalette(); return; }
+        state.selectedSwatch = i; renderPalette();
+      });
+      const del = document.createElement("div");
+      del.className = "del"; del.textContent = "✕";
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.palette.splice(i, 1);
+        if (state.selectedSwatch >= state.palette.length) state.selectedSwatch = state.palette.length - 1;
+        renderPalette();
+        if (state.compareOpen) renderCompare();
+      });
+      d.appendChild(del);
+      grid.appendChild(d);
+    });
+    el("paletteMeta").textContent = state.palette.length
+      ? `${state.palette.length} цветов, ${state.palette.filter(s => s.protected).length} помечено как акцент. Shift+клик — пометить/снять.`
+      : "";
+    if (state.compareOpen) renderCompare();
+  }
+
+  function exportPalettePNG() {
+    if (!state.palette.length) return;
+    const swatch = 32;
+    const c = document.createElement("canvas");
+    c.width = swatch * state.palette.length;
+    c.height = swatch;
+    const cctx = c.getContext("2d");
+    state.palette.forEach((sw, i) => { cctx.fillStyle = sw.hex; cctx.fillRect(i * swatch, 0, swatch, swatch); });
+    downloadCanvas(c, "palette.png");
+  }
+
+  // ---------------------------------------------------------------
+  // Live recolor: remap the CURRENT snapped frame's pixels to the
+  // nearest color in the CURRENT (possibly hand-edited) palette.
+  // Fully client-side — this is the "live preview of palette edits"
+  // without needing to round-trip through ComfyUI.
+  // ---------------------------------------------------------------
+  const recoloredCanvas = document.createElement("canvas");
+
+  function computeRecolored() {
+    const f = state.frames[state.currentFrame];
+    if (!f || !state.palette.length) return null;
+    const paletteRGB = state.palette.map((s) => hexToRgb(s.hex));
+    const id = f.ctx.getImageData(0, 0, f.w, f.h);
+    const out = new ImageData(f.w, f.h);
+    for (let i = 0; i < id.data.length; i += 4) {
+      let best = 0, bestD = Infinity;
+      const r = id.data[i], g = id.data[i + 1], b = id.data[i + 2];
+      for (let p = 0; p < paletteRGB.length; p++) {
+        const [pr, pg, pb] = paletteRGB[p];
+        const d = (r - pr) * (r - pr) + (g - pg) * (g - pg) + (b - pb) * (b - pb);
+        if (d < bestD) { bestD = d; best = p; }
+      }
+      out.data[i] = paletteRGB[best][0];
+      out.data[i + 1] = paletteRGB[best][1];
+      out.data[i + 2] = paletteRGB[best][2];
+      out.data[i + 3] = id.data[i + 3];
+    }
+    recoloredCanvas.width = f.w;
+    recoloredCanvas.height = f.h;
+    recoloredCanvas.getContext("2d").putImageData(out, 0, 0);
+    return { canvas: recoloredCanvas, w: f.w, h: f.h };
+  }
+
+  // ---------------------------------------------------------------
+  // Compare overlay (before/after slider)
+  // ---------------------------------------------------------------
+  const LABELS = { raw: "Исходник", snapped: "Обработанный", recolored: "С новой палитрой" };
+  let compareSplit = 50;
+
+  function drawFitted(ctx, src, boxW, boxH) {
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, boxW, boxH);
+    const scale = Math.min(boxW / src.w, boxH / src.h);
+    const w = src.w * scale, h = src.h * scale;
+    const x = (boxW - w) / 2, y = (boxH - h) / 2;
+    ctx.drawImage(src.canvas, 0, 0, src.w, src.h, x, y, w, h);
+  }
+
+  function updateSplit() {
+    el("compareTop").style.clipPath = `inset(0 ${100 - compareSplit}% 0 0)`;
+    el("compareHandle").style.left = compareSplit + "%";
+  }
+
+  function renderCompare() {
+    const pair = el("comparePairSelect").value.split("_");
+    const sources = { raw: state.rawFrame, snapped: state.frames[state.currentFrame], recolored: computeRecolored() };
+    const leftSrc = sources[pair[0]], rightSrc = sources[pair[1]];
+    el("labelLeft").textContent = LABELS[pair[0]];
+    el("labelRight").textContent = LABELS[pair[1]];
+    const box = el("compareBox");
+    const w = box.clientWidth, h = box.clientHeight;
+    const top = el("compareTop"), bottom = el("compareBottom");
+    top.width = w; top.height = h; bottom.width = w; bottom.height = h;
+    const missing = [];
+    if (!leftSrc) missing.push(LABELS[pair[0]]);
+    if (!rightSrc) missing.push(LABELS[pair[1]]);
+    if (missing.length) {
+      el("compareMsg").textContent = `Не хватает: ${missing.join(", ")}.` +
+        (missing.includes(LABELS.raw) ? " Загрузи исходный кадр слева." : "") +
+        (missing.includes(LABELS.recolored) ? " Загрузи/собери палитру." : "");
+      top.getContext("2d").clearRect(0, 0, w, h);
+      bottom.getContext("2d").clearRect(0, 0, w, h);
+      return;
+    }
+    el("compareMsg").textContent = "";
+    drawFitted(top.getContext("2d"), leftSrc, w, h);
+    drawFitted(bottom.getContext("2d"), rightSrc, w, h);
+    updateSplit();
+  }
+
+  function openCompare() {
+    state.compareOpen = true;
+    el("compareOverlay").classList.remove("hidden");
+    renderCompare();
+  }
+  function closeCompare() {
+    state.compareOpen = false;
+    el("compareOverlay").classList.add("hidden");
+  }
+
+  let draggingHandle = false;
+  function setSplitFromEvent(e) {
+    const rect = el("compareBox").getBoundingClientRect();
+    compareSplit = Math.min(100, Math.max(0, ((e.clientX - rect.left) / rect.width) * 100));
+    updateSplit();
+  }
+  el("compareBox").addEventListener("pointerdown", (e) => { draggingHandle = true; setSplitFromEvent(e); });
+  window.addEventListener("pointermove", (e) => { if (draggingHandle) setSplitFromEvent(e); });
+  window.addEventListener("pointerup", () => { draggingHandle = false; });
+  window.addEventListener("resize", () => { if (state.compareOpen) renderCompare(); });
+
+  // ---------------------------------------------------------------
+  // Painting / picking / panning on the current frame
+  // ---------------------------------------------------------------
+  function canvasEventToPixel(e) {
+    const f = state.frames[state.currentFrame];
+    if (!f) return null;
+    const rect = frameCanvas.getBoundingClientRect(); // reflects the live CSS transform (pan+zoom)
+    const x = Math.floor((e.clientX - rect.left) / (rect.width / f.w));
+    const y = Math.floor((e.clientY - rect.top) / (rect.height / f.h));
+    if (x < 0 || y < 0 || x >= f.w || y >= f.h) return null;
+    return { x, y };
+  }
+
+  function paintAt(x, y) {
+    const f = state.frames[state.currentFrame];
+    if (!f || state.selectedSwatch < 0) return;
+    f.ctx.fillStyle = state.palette[state.selectedSwatch].hex;
+    f.ctx.fillRect(x, y, 1, 1);
+    renderCurrentFrame();
+    renderFrameStripThumbAt(state.currentFrame);
+    if (state.compareOpen) renderCompare();
+  }
+
+  function pickAt(x, y) {
+    const f = state.frames[state.currentFrame];
+    if (!f) return;
+    const d = f.ctx.getImageData(x, y, 1, 1).data;
+    const hex = rgbToHex(d[0], d[1], d[2]);
+    const idx = state.palette.findIndex((s) => s.hex.toLowerCase() === hex.toLowerCase());
+    if (idx >= 0) { state.selectedSwatch = idx; }
+    else { state.palette.push({ hex, protected: false }); state.selectedSwatch = state.palette.length - 1; }
+    renderPalette();
+  }
+
+  let painting = false;
+  frameCanvas.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || state.tool === "pan") return;
+    const p = canvasEventToPixel(e);
+    if (!p) return;
+    if (state.tool === "paint") { painting = true; paintAt(p.x, p.y); }
+    else if (state.tool === "pick") { pickAt(p.x, p.y); }
+  });
+  frameCanvas.addEventListener("pointermove", (e) => {
+    if (state.tool === "pick") {
+      const p = canvasEventToPixel(e);
+      const f = state.frames[state.currentFrame];
+      if (p && f) {
+        const d = f.ctx.getImageData(p.x, p.y, 1, 1).data;
+        const hex = rgbToHex(d[0], d[1], d[2]);
+        el("pickPreview").style.display = "flex";
+        el("pickSwatch").style.background = hex;
+        const inPalette = state.palette.some((s) => s.hex.toLowerCase() === hex.toLowerCase());
+        el("pickStatus").textContent = hex + (inPalette ? " — есть в палитре" : " — нет в палитре");
+        el("pickStatus").style.color = inPalette ? "var(--accent-2)" : "var(--text-dim)";
+      }
+    } else if (painting && state.tool === "paint") {
+      const p = canvasEventToPixel(e);
+      if (p) paintAt(p.x, p.y);
+    }
+  });
+  frameCanvas.addEventListener("pointerleave", () => { el("pickPreview").style.display = "none"; });
+  window.addEventListener("pointerup", () => { painting = false; });
+
+  // pan: drag with Pan tool active, or middle-mouse-button drag in any tool
+  let panning = false, panStart = null;
+  stage.addEventListener("pointerdown", (e) => {
+    if (state.tool === "pan" || e.button === 1) {
+      panning = true;
+      panStart = { x: e.clientX, y: e.clientY, panX: view.panX, panY: view.panY };
+      e.preventDefault();
+    }
+  });
+  window.addEventListener("pointermove", (e) => {
+    if (!panning) return;
+    view.panX = panStart.panX + (e.clientX - panStart.x);
+    view.panY = panStart.panY + (e.clientY - panStart.y);
+    clampPan();
+    applyTransform();
+  });
+  window.addEventListener("pointerup", () => { panning = false; });
+
+  // wheel: pan always; ctrl/cmd+wheel: zoom around cursor
+  stage.addEventListener("wheel", (e) => {
+    if (!state.frames.length) return;
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) {
+      const dir = e.deltaY < 0 ? 1 : -1;
+      const newZoom = Math.min(32, Math.max(1, view.zoom + dir));
+      const rect = stage.getBoundingClientRect();
+      const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+      const imgX = (cx - view.panX) / view.zoom, imgY = (cy - view.panY) / view.zoom;
+      view.zoom = newZoom;
+      view.panX = cx - imgX * view.zoom;
+      view.panY = cy - imgY * view.zoom;
+      el("zoomRange").value = newZoom;
+      el("zoomLabel").textContent = newZoom + "x";
+    } else {
+      view.panX -= e.deltaX;
+      view.panY -= e.deltaY;
+    }
+    clampPan();
+    applyTransform();
+  }, { passive: false });
+
+  el("zoomRange").addEventListener("input", (e) => {
+    if (!state.frames.length) return;
+    const newZoom = parseInt(e.target.value, 10);
+    const rect = stage.getBoundingClientRect();
+    const cx = rect.width / 2, cy = rect.height / 2;
+    const imgX = (cx - view.panX) / view.zoom, imgY = (cy - view.panY) / view.zoom;
+    view.zoom = newZoom;
+    view.panX = cx - imgX * view.zoom;
+    view.panY = cy - imgY * view.zoom;
+    el("zoomLabel").textContent = newZoom + "x";
+    clampPan();
+    applyTransform();
+  });
+
+  window.addEventListener("resize", () => { clampPan(); applyTransform(); });
+
+  // ---------------------------------------------------------------
+  // Export / clear / misc
+  // ---------------------------------------------------------------
+  function downloadCanvas(c, name) {
+    c.toBlob((blob) => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+    });
+  }
+  function exportCurrentFrame() {
+    const f = state.frames[state.currentFrame];
+    if (!f) return;
+    downloadCanvas(f.canvas, (f.name.replace(/\.[a-z]+$/i, "") || "frame") + "_edited.png");
+  }
+  function resetCurrentFrame() {
+    const f = state.frames[state.currentFrame];
+    if (!f) return;
+    f.ctx.clearRect(0, 0, f.w, f.h);
+    f.ctx.drawImage(f.img, 0, 0);
+    renderCurrentFrame();
+    renderFrameStripThumbAt(state.currentFrame);
+    if (state.compareOpen) renderCompare();
+  }
+
+  // ---------------------------------------------------------------
+  // Wiring
+  // ---------------------------------------------------------------
+  el("frameInput").addEventListener("change", (e) => addFrames(e.target.files));
+  el("loadFolder").addEventListener("click", async () => {
+    if (!window.showDirectoryPicker) {
+      alert("Загрузка папки одним кликом поддерживается только в Chrome/Edge (File System Access API). " +
+            "В остальных браузерах используй «Загрузить кадры» и выдели все файлы сразу в диалоге.");
+      return;
+    }
+    try {
+      const dirHandle = await window.showDirectoryPicker();
+      const files = [];
+      for await (const [name, handle] of dirHandle.entries()) {
+        if (handle.kind === "file" && /\.(png|jpe?g|webp|bmp)$/i.test(name)) files.push(await handle.getFile());
+      }
+      if (files.length) await addFrames(files);
+    } catch (err) {
+      if (err && err.name !== "AbortError") console.error(err);
+    }
+  });
+  el("clearFrames").addEventListener("click", () => {
+    if (!state.frames.length) return;
+    if (!confirm("Удалить все загруженные кадры?")) return;
+    state.frames = []; state.currentFrame = -1;
+    renderFrameStrip(); renderCurrentFrame();
+    if (state.compareOpen) renderCompare();
+  });
+
+  el("paletteInput").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const img = await loadImageFile(file);
+    setPalette(await extractPaletteFromImage(img));
+  });
+  el("extractFromFrame").addEventListener("click", async () => {
+    const f = state.frames[state.currentFrame];
+    if (!f) return;
+    setPalette(await extractPaletteFromImage(f.img));
+  });
+  el("clearPalette").addEventListener("click", () => {
+    if (!state.palette.length) return;
+    if (!confirm("Удалить всю палитру?")) return;
+    state.palette = []; state.selectedSwatch = -1;
+    renderPalette();
+  });
+
+  el("rawInput").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const img = await loadImageFile(file);
+    const c = document.createElement("canvas");
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext("2d").drawImage(img, 0, 0);
+    state.rawFrame = { canvas: c, w: c.width, h: c.height };
+    if (state.compareOpen) renderCompare();
+  });
+  el("openCompare").addEventListener("click", openCompare);
+  el("closeCompare").addEventListener("click", closeCompare);
+  el("comparePairSelect").addEventListener("change", () => { if (state.compareOpen) renderCompare(); });
+
+  el("prevFrame").addEventListener("click", () => switchToFrame(state.currentFrame - 1));
+  el("nextFrame").addEventListener("click", () => switchToFrame(state.currentFrame + 1));
+
+  [["toolPaint", "paint"], ["toolPick", "pick"], ["toolPan", "pan"]].forEach(([id, tool]) => {
+    el(id).addEventListener("click", () => {
+      state.tool = tool;
+      document.querySelectorAll(".tool-toggle button").forEach((b) => b.classList.remove("active"));
+      el(id).classList.add("active");
+      frameCanvas.style.cursor = tool === "paint" ? "crosshair" : (tool === "pick" ? "copy" : "grab");
+      if (tool !== "pick") el("pickPreview").style.display = "none";
+    });
+  });
+
+  el("exportPalette").addEventListener("click", exportPalettePNG);
+  el("exportFrame").addEventListener("click", exportCurrentFrame);
+  el("resetFrame").addEventListener("click", resetCurrentFrame);
+
+  ["dragenter", "dragover"].forEach((ev) => stage.addEventListener(ev, (e) => e.preventDefault()));
+  stage.addEventListener("drop", (e) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
+    if (files.length) addFrames(files);
+  });
+
+  renderPalette();
+  renderFrameStrip();
+})();
+</script>
+</body>
+</html>
