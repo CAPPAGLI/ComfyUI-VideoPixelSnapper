@@ -93,7 +93,7 @@ app.registerExtension({
       const wrap = document.createElement("div");
       wrap.style.cssText =
         "display:flex;flex-direction:column;gap:6px;padding:8px;background:#1b1e24;" +
-        "border-radius:6px;min-width:280px;font-family:monospace;";
+        "border-radius:6px;width:100%;min-width:280px;box-sizing:border-box;font-family:monospace;";
       wrap.innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
           <div style="font-size:10px;color:#8b909c;text-transform:uppercase;letter-spacing:.05em;">
@@ -166,6 +166,12 @@ app.registerExtension({
         <div style="display:flex;gap:4px;flex-shrink:0;">
           <button class="vps-replace-apply" disabled title="Replaces the color selected with the Replace tool"
                   style="flex:1;font-size:10px;padding:4px;">Replace selected</button>
+        </div>
+        <div style="display:flex;gap:4px;flex-shrink:0;">
+          <button class="vps-apply-saved-subst" title="Re-applies remembered from-color -> to-color substitutions to whichever palette entries are currently closest to each remembered 'from' — safer than reusing a whole saved palette verbatim on a different image/scene"
+                  style="flex:2;font-size:10px;padding:4px;">Apply saved substitutions</button>
+          <button class="vps-clear-saved-subst" title="Forgets all remembered substitutions (stored in this browser only)"
+                  style="flex:1;font-size:10px;padding:4px;">Forget</button>
         </div>
 
         <div class="vps-palette" style="display:grid;grid-template-columns:repeat(auto-fill,20px);grid-auto-rows:20px;
@@ -395,6 +401,13 @@ app.registerExtension({
           st.livePalette.push(hex);
           renderPaletteRow();
           redrawBox("live");
+          // Best-effort hardening: if something in the host page's own
+          // render cycle (e.g. ComfyUI's newer Vue-based "Nodes 2.0"
+          // rendering, still beta) defers/batches DOM updates in a way
+          // that leaves an imperative canvas draw visually stale until
+          // the next reactive tick, forcing one more redraw on the next
+          // animation frame should catch it. Harmless no-op otherwise.
+          requestAnimationFrame(() => redrawBox("live"));
           statusEl.textContent = `Added ${hex} to the palette (${st.livePalette.length} colors).`;
         } else {
           statusEl.textContent = `${hex} is already in the palette.`;
@@ -426,6 +439,59 @@ app.registerExtension({
         return best;
       }
       function updateReplaceApplyState() { replaceApplyBtn.disabled = st.replaceSource == null; }
+
+      // --- persistent "this color was intentionally replaced" memory ---
+      // Deliberately NOT encoded into the exported palette PNG/metadata:
+      // that would mean patching raw PNG chunk structure (real risk of a
+      // subtle encoding bug) and, more importantly, the core node's
+      // custom_palette loader just reads unique pixel colors from
+      // whatever image it's given — any extra encoded pixels would leak
+      // into the actual palette used for processing unless the Python
+      // side were also taught to ignore them. localStorage keeps this
+      // entirely on the editing side, with zero risk to the real
+      // pipeline, at the cost of not traveling with the file itself.
+      const SUBST_KEY = "vps_color_substitutions_v1";
+      function loadSubstitutions() {
+        try { return JSON.parse(localStorage.getItem(SUBST_KEY) || "[]"); }
+        catch (err) { return []; }
+      }
+      function saveSubstitutions(list) {
+        try { localStorage.setItem(SUBST_KEY, JSON.stringify(list.slice(-200))); }
+        catch (err) { log("failed to save substitution memory: " + (err?.message || err)); }
+      }
+      function recordSubstitution(fromHex, toHex) {
+        const list = loadSubstitutions();
+        const i = list.findIndex((r) => r.from === fromHex);
+        const entry = { from: fromHex, to: toHex, ts: Date.now() };
+        if (i >= 0) list[i] = entry; else list.push(entry);
+        saveSubstitutions(list);
+      }
+      function applySavedSubstitutions() {
+        const rules = loadSubstitutions();
+        if (!rules.length) { statusEl.textContent = "No saved substitutions yet — use Replace at least once first."; return; }
+        const THRESHOLD = 40; // RGB-space distance; a rough "close enough to be the same intended color" cutoff
+        let applied = 0;
+        rules.forEach((rule) => {
+          const [fr, fg, fb] = hexToRgb(rule.from);
+          let best = -1, bestD = Infinity;
+          st.livePalette.forEach((h, i) => {
+            const [pr, pg, pb] = hexToRgb(h);
+            const d = Math.hypot(fr - pr, fg - pg, fb - pb);
+            if (d < bestD) { bestD = d; best = i; }
+          });
+          if (best >= 0 && bestD <= THRESHOLD) { st.livePalette[best] = rule.to; applied++; }
+        });
+        renderPaletteRow();
+        redrawBox("live");
+        statusEl.textContent = `Applied ${applied} of ${rules.length} saved substitution(s) ` +
+          `(others had no close-enough match in the current palette — that's expected on a very different scene).`;
+      }
+      wrap.querySelector(".vps-apply-saved-subst").addEventListener("click", applySavedSubstitutions);
+      wrap.querySelector(".vps-clear-saved-subst").addEventListener("click", () => {
+        saveSubstitutions([]);
+        statusEl.textContent = "Forgot all saved color substitutions.";
+      });
+
       function applyReplace(targetHex) {
         if (st.replaceSource == null || st.replaceSource >= st.livePalette.length) return;
         const idx = st.replaceSource;
@@ -433,10 +499,11 @@ app.registerExtension({
         targetHex = targetHex.toLowerCase();
         st.livePalette[idx] = targetHex;
         st.replaceSource = null;
+        recordSubstitution(oldHex, targetHex);
         renderPaletteRow();
         updateReplaceApplyState();
         redrawBox("live");
-        statusEl.textContent = `Replaced ${oldHex} → ${targetHex}.`;
+        statusEl.textContent = `Replaced ${oldHex} → ${targetHex}. Remembered — "Apply saved substitutions" will try to reapply this on future palettes.`;
       }
       function handleReplaceClick(hex) {
         if (!st.livePalette.length) return;
@@ -711,7 +778,18 @@ app.registerExtension({
           node._vps.measurePoints = [];
           node._vps.view = { zoom: 1, panX: 0, panY: 0 };
           node._vps.originalPalette = await internal.loadPaletteFromRef(palette[0]);
-          node._vps.livePalette = node._vps.originalPalette.slice();
+          // Only seed livePalette from the fresh auto-detection on the
+          // very first load. A node can re-execute (cache invalidation,
+          // re-queued runs, etc.) for reasons that have nothing to do
+          // with "the user wants their edits discarded" — unconditionally
+          // overwriting livePalette here silently wiped out Pick/Delete/
+          // Replace edits on any such re-run, which looked exactly like
+          // "the tool doesn't update" from the outside. Reset (the
+          // button) always uses the latest originalPalette if you
+          // actually do want to start over.
+          if (!node._vps.livePalette.length) {
+            node._vps.livePalette = node._vps.originalPalette.slice();
+          }
           internal.renderPaletteRow();
           await internal.goToFrame(0);
           internal.statusEl.textContent = `${node._vps.livePalette.length} colors, ${frames.length} frame(s). Pick/Delete/Replace/Measure — click any preview.`;

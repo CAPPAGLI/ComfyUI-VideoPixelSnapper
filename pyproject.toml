@@ -1,0 +1,14 @@
+[project]
+name = "video-pixel-snapper"  # TODO: must be globally unique on the registry; change if taken. Immutable after first publish.
+description = "Batch/video-aware pixel-art snapper for ComfyUI: stable grid + palette across a whole clip, plus an in-graph live palette editor."
+version = "1.7.1"
+license = { file = "LICENSE" }
+dependencies = []  # torch/numpy/Pillow are already provided by ComfyUI itself
+
+[project.urls]
+Repository = "https://github.com/CAPPAGLI/ComfyUI-VideoPixelSnapper"
+
+[tool.comfy]
+PublisherId = "TODO-your-publisher-id"  # TODO: create one at https://registry.comfy.org, then paste it here
+DisplayName = "Video Pixel Snapper"
+# Icon = "https://example.com/icon.png"  # optional: SVG/PNG/JPG/GIF, max 800x400px

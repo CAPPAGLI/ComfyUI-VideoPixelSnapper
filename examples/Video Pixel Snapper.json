@@ -1,0 +1,587 @@
+{
+  "id": "90e634ca-4bca-4a43-b951-447cffa4243c",
+  "revision": 9,
+  "last_node_id": 8,
+  "last_link_id": 12,
+  "nodes": [
+    {
+      "id": 4,
+      "type": "VideoPixelSnapperEditor",
+      "pos": [
+        3500,
+        -5195.74
+      ],
+      "size": [
+        875.19,
+        841.19
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "original_image",
+          "type": "IMAGE",
+          "link": 4
+        },
+        {
+          "name": "snapped_image",
+          "type": "IMAGE",
+          "link": 10
+        },
+        {
+          "name": "palette_preview",
+          "type": "IMAGE",
+          "link": 6
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VideoPixelSnapperEditor"
+      },
+      "widgets_values": [
+        24
+      ]
+    },
+    {
+      "id": 5,
+      "type": "VideoPixelSnapper",
+      "pos": [
+        2724.22,
+        -5129.41
+      ],
+      "size": [
+        327.94,
+        424.13
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 7
+        },
+        {
+          "name": "custom_palette",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 8
+        },
+        {
+          "name": "foreground_mask",
+          "shape": 7,
+          "type": "MASK",
+          "link": null
+        },
+        {
+          "name": "background_image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            5
+          ]
+        },
+        {
+          "name": "palette_preview",
+          "type": "IMAGE",
+          "links": [
+            1,
+            6
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": [
+            9,
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VideoPixelSnapper"
+      },
+      "widgets_values": [
+        6,
+        "average_across_frames",
+        "majority",
+        32,
+        4,
+        8,
+        "bayer4",
+        false,
+        "manual",
+        1,
+        1526581513,
+        "randomize",
+        0.5,
+        0.25,
+        false
+      ]
+    },
+    {
+      "id": 6,
+      "type": "VHS_LoadVideoFFmpeg",
+      "pos": [
+        2376.84,
+        -5194.26
+      ],
+      "size": [
+        313.47,
+        463.26
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4,
+            7,
+            11
+          ]
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        },
+        {
+          "name": "video_info",
+          "type": "VHS_VIDEOINFO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VHS_LoadVideoFFmpeg"
+      },
+      "widgets_values": {
+        "video": "example.mp4",
+        "force_rate": 3,
+        "custom_width": 0,
+        "custom_height": 0,
+        "frame_load_cap": 0,
+        "start_time": 0,
+        "format": "None"
+      }
+    },
+    {
+      "id": 3,
+      "type": "VideoPixelSnapperFrameRetimer",
+      "pos": [
+        4410,
+        -5192.82
+      ],
+      "size": [
+        776.67,
+        1055.56
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VideoPixelSnapperFrameRetimer"
+      },
+      "widgets_values": [
+        "[0,0,4,1,1,1,1,2,2,1,1,1,1,0,0,0]",
+        0,
+        100
+      ]
+    },
+    {
+      "id": 2,
+      "type": "VHS_VideoCombine",
+      "pos": [
+        5230,
+        -5201.5
+      ],
+      "size": [
+        583.56,
+        662.45
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Filenames",
+          "type": "VHS_FILENAMES",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VHS_VideoCombine",
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "1.7.2"
+      },
+      "widgets_values": {
+        "frame_rate": 10,
+        "loop_count": 0,
+        "filename_prefix": "VideoPixelSnapper/Vid",
+        "format": "video/h264-mp4",
+        "pix_fmt": "yuv420p",
+        "crf": 19,
+        "save_metadata": true,
+        "trim_to_audio": false,
+        "pingpong": null,
+        "save_output": true
+      }
+    },
+    {
+      "id": 1,
+      "type": "PreviewImage",
+      "pos": [
+        5635.7,
+        -4821.88
+      ],
+      "size": [
+        513.44,
+        270
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 7,
+      "type": "LoadImage",
+      "pos": [
+        2382.46,
+        -4692.52
+      ],
+      "size": [
+        282.31,
+        339.56
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            8
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "palette.png",
+        "image"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "VideoPixelSnapperTemporalCleanup",
+      "pos": [
+        3070,
+        -5200
+      ],
+      "size": [
+        390,
+        620
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 5
+        },
+        {
+          "name": "guide_image",
+          "type": "IMAGE",
+          "link": 11
+        },
+        {
+          "name": "snapper_info",
+          "type": "STRING",
+          "link": 12
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            10
+          ]
+        },
+        {
+          "name": "motion_confidence",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "confidence_preview",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "changed_cells",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "silhouette_changes",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "edge_color_changes",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "feature_color_changes",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VideoPixelSnapperTemporalCleanup"
+      },
+      "widgets_values": [
+        "detail_lock",
+        "balanced",
+        "raft_small",
+        "auto",
+        2
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      5,
+      1,
+      1,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      3,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      4,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      6,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      5,
+      0,
+      8,
+      0,
+      "IMAGE"
+    ],
+    [
+      6,
+      5,
+      1,
+      4,
+      2,
+      "IMAGE"
+    ],
+    [
+      7,
+      6,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      8,
+      7,
+      0,
+      5,
+      1,
+      "IMAGE"
+    ],
+    [
+      9,
+      5,
+      2,
+      4,
+      3,
+      "STRING"
+    ],
+    [
+      10,
+      8,
+      0,
+      4,
+      1,
+      "IMAGE"
+    ],
+    [
+      11,
+      6,
+      0,
+      8,
+      1,
+      "IMAGE"
+    ],
+    [
+      12,
+      5,
+      2,
+      8,
+      2,
+      "STRING"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.573085533,
+      "offset": [
+        -1838.51,
+        5559.31
+      ]
+    },
+    "frontendVersion": "1.47.10"
+  },
+  "version": 0.4
+}

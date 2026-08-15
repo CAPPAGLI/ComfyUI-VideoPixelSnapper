@@ -25,6 +25,16 @@ function hexToRgb(hex) {
 function rgbToHex(r, g, b) {
   return "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
+function normalizeHex(value) {
+  const hex = String(value || "").trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(hex) ? hex : null;
+}
+function palettesHaveSameColors(a, b) {
+  if (a.length !== b.length) return false;
+  const aa = a.map((hex) => hex.toLowerCase()).sort();
+  const bb = b.map((hex) => hex.toLowerCase()).sort();
+  return aa.every((hex, i) => hex === bb[i]);
+}
 function loadImage(url) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -76,6 +86,75 @@ function buildPaletteLUT(paletteRGB) {
   return lut;
 }
 
+// Reduces a full-resolution RAW canvas down to (targetW x targetH) — one
+// color per output cell, taken as the per-channel MEDIAN of the raw
+// pixels that fall in that cell. Palette-independent (only depends on
+// the raw image + grid), so it's cached once per frame and reused
+// across any number of palette edits — see computeLiveCanvas for why
+// this replaced re-classifying the already-quantized snapped cache.
+//
+// `grid`, if given (from Video Pixel Snapper's `info` output, wired
+// into this node's optional `info` input), is {block, phaseX, phaseY}
+// — the REAL detected grid, so cell boundaries line up exactly with
+// what the core node actually used. Without it, falls back to a naive
+// centered block mapping, which can be a cell or two off from the true
+// alignment. Either way this is still a MEDIAN reduction, not the core
+// node's actual majority-vote-with-confidence-margin algorithm, so an
+// exact pixel-for-pixel match with "Snapped" isn't guaranteed even
+// with the right grid — the real, authoritative result always comes
+// from re-running the graph. This is a fast, close approximation for
+// live editing feedback, not a reimplementation of the whole pipeline.
+function blockMedianReduce(srcCanvas, targetW, targetH, grid) {
+  const srcW = srcCanvas.width, srcH = srcCanvas.height;
+  const sctx = srcCanvas.getContext("2d", { willReadFrequently: true });
+  const src = sctx.getImageData(0, 0, srcW, srcH).data;
+  const out = new ImageData(targetW, targetH);
+
+  function medianCell(x0, y0, x1, y1, oi) {
+    const rs = [], gs = [], bs = [];
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * srcW + x) * 4;
+        rs.push(src[i]); gs.push(src[i + 1]); bs.push(src[i + 2]);
+      }
+    }
+    if (!rs.length) return;
+    rs.sort((a, b) => a - b); gs.sort((a, b) => a - b); bs.sort((a, b) => a - b);
+    // torch.median uses the lower middle element for an even sample count.
+    const mid = (rs.length - 1) >> 1;
+    out.data[oi] = rs[mid]; out.data[oi + 1] = gs[mid]; out.data[oi + 2] = bs[mid]; out.data[oi + 3] = 255;
+  }
+
+  if (grid && grid.block > 0) {
+    const block = grid.block;
+    const px = ((grid.phaseX % block) + block) % block;
+    const py = ((grid.phaseY % block) + block) % block;
+    for (let cy = 0; cy < targetH; cy++) {
+      const y0 = py + cy * block, y1 = Math.min(srcH, y0 + block);
+      if (y0 >= srcH) continue;
+      for (let cx = 0; cx < targetW; cx++) {
+        const x0 = px + cx * block, x1 = Math.min(srcW, x0 + block);
+        if (x0 >= srcW) continue;
+        medianCell(x0, y0, x1, y1, (cy * targetW + cx) * 4);
+      }
+    }
+    return out;
+  }
+
+  // fallback: naive centered division (used when no `info` is connected)
+  const blockW = srcW / targetW, blockH = srcH / targetH;
+  for (let cy = 0; cy < targetH; cy++) {
+    const y0 = Math.floor(cy * blockH);
+    const y1 = Math.max(y0 + 1, Math.floor((cy + 1) * blockH));
+    for (let cx = 0; cx < targetW; cx++) {
+      const x0 = Math.floor(cx * blockW);
+      const x1 = Math.max(x0 + 1, Math.floor((cx + 1) * blockW));
+      medianCell(x0, y0, x1, y1, (cy * targetW + cx) * 4);
+    }
+  }
+  return out;
+}
+
 app.registerExtension({
   name: "VideoPixelSnapper.LiveEditor",
 
@@ -93,7 +172,7 @@ app.registerExtension({
       const wrap = document.createElement("div");
       wrap.style.cssText =
         "display:flex;flex-direction:column;gap:6px;padding:8px;background:#1b1e24;" +
-        "border-radius:6px;min-width:280px;font-family:monospace;";
+        "border-radius:6px;width:100%;min-width:280px;box-sizing:border-box;font-family:monospace;";
       wrap.innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
           <div style="font-size:10px;color:#8b909c;text-transform:uppercase;letter-spacing:.05em;">
@@ -124,7 +203,7 @@ app.registerExtension({
                            image-rendering:pixelated;touch-action:none;"></canvas>
           </div>
           <div style="flex:1;min-width:0;">
-            <div style="font-size:8px;color:#8b909c;text-align:center;">Live (your edit)</div>
+            <div class="vps-live-label" style="font-size:8px;color:#8b909c;text-align:center;">Live (your edit)</div>
             <canvas data-src="live" style="width:100%;height:84px;display:block;background:#111;border-radius:3px;
                            image-rendering:pixelated;touch-action:none;"></canvas>
           </div>
@@ -167,6 +246,12 @@ app.registerExtension({
           <button class="vps-replace-apply" disabled title="Replaces the color selected with the Replace tool"
                   style="flex:1;font-size:10px;padding:4px;">Replace selected</button>
         </div>
+        <div style="display:flex;gap:4px;flex-shrink:0;">
+          <button class="vps-apply-saved-subst" title="Re-applies remembered from-color -> to-color substitutions to whichever palette entries are currently closest to each remembered 'from' — safer than reusing a whole saved palette verbatim on a different image/scene"
+                  style="flex:2;font-size:10px;padding:4px;">Apply saved substitutions</button>
+          <button class="vps-clear-saved-subst" title="Forgets all remembered substitutions (stored in this browser only)"
+                  style="flex:1;font-size:10px;padding:4px;">Forget</button>
+        </div>
 
         <div class="vps-palette" style="display:grid;grid-template-columns:repeat(auto-fill,20px);grid-auto-rows:20px;
                     gap:3px;max-height:100px;overflow-y:auto;padding:2px;background:#14161a;border-radius:4px;flex-shrink:0;"></div>
@@ -195,8 +280,14 @@ app.registerExtension({
         rawRefs: [], frameRefs: [],
         frameIdx: 0,
         rawCache: {}, snappedCache: {},   // frameIdx -> {canvas,w,h}, loaded lazily
+        rawReducedCache: {},              // frameIdx -> ImageData: raw pixels block-reduced to cell
+                                           // resolution, palette-INDEPENDENT (see computeLiveCanvas)
+        grid: null,                       // {block,phaseX,phaseY,cellsW,cellsH,scale}
+                                           // from the optional core `info` connection
+        backgroundHex: null,              // locked mask background, when reported by core
         originalPalette: [],
         livePalette: [],
+        paletteDirty: false,              // preserve edits on re-run, but refresh untouched palettes
         liveCache: { key: null, data: null },  // memoized live-recolor result
         tool: null,                       // 'pick' | 'delete' | 'replace' | 'measure' | null
         replaceSource: null,              // index into livePalette pending replacement
@@ -215,6 +306,7 @@ app.registerExtension({
       const colorPick = wrap.querySelector(".vps-colorpick");
       const hexInput = wrap.querySelector(".vps-hexinput");
       const frameCounter = wrap.querySelector(".vps-framecount");
+      const liveLabel = wrap.querySelector(".vps-live-label");
       const replaceApplyBtn = wrap.querySelector(".vps-replace-apply");
       const measurePanel = wrap.querySelector(".vps-measure-panel");
       const measureInfo = wrap.querySelector(".vps-measure-info");
@@ -228,41 +320,107 @@ app.registerExtension({
       // far more often than needed. Memoize on (frame, palette contents)
       // so it only recomputes when something that actually changes the
       // result changes.
+      function getRawReduced() {
+        const cached = st.rawReducedCache[st.frameIdx];
+        if (cached) return cached;
+        const raw = st.rawCache[st.frameIdx];
+        const snapped = st.snappedCache[st.frameIdx];
+        if (!raw || !snapped) return null;
+
+        // The snapped preview can be an integer nearest-neighbor upscale
+        // (for example 117x81 for a 13x9 cell grid). Reducing RAW directly
+        // to snapped.w/snapped.h would then create fake sub-cells and make
+        // the Live panel disagree with the Python node. Rich grid metadata
+        // supplies the real cell dimensions; old workflows without the
+        // optional `info` wire retain the previous best-effort fallback.
+        const targetW = st.grid?.cellsW || snapped.w;
+        const targetH = st.grid?.cellsH || snapped.h;
+        const reduced = blockMedianReduce(raw.canvas, targetW, targetH, st.grid);
+        st.rawReducedCache[st.frameIdx] = reduced;
+        return reduced;
+      }
+
+      // With no palette edits, Live must be an exact visual control: use
+      // the authoritative Python-generated Snapped frame itself. Merely
+      // sharing a palette was not enough before, because the browser used
+      // a median cell representative while Python may have used majority,
+      // center weighting, dithering, and/or despeckle.
+      //
+      // Once the palette differs, classify the block-reduced RAW image.
+      // That is intentionally retained instead of recoloring the old
+      // snapped cache: a newly added color could never win against pixels
+      // that had already been quantized under the old palette.
       function computeLiveCanvas() {
-        const base = st.snappedCache[st.frameIdx];
-        if (!base || !st.livePalette.length) return null;
+        if (!st.livePalette.length) return null;
         const cacheKey = st.frameIdx + "::" + st.livePalette.join(",");
         if (st.liveCache.key === cacheKey) return st.liveCache.data;
 
-        const { canvas: src, w, h } = base;
-        const id = src.getContext("2d").getImageData(0, 0, w, h);
+        const snapped = st.snappedCache[st.frameIdx];
+        const exactBaseline = !st.paletteDirty ||
+          palettesHaveSameColors(st.livePalette, st.originalPalette);
+        if (snapped && exactBaseline) {
+          liveLabel.textContent = "Live (exactly matches Snapped)";
+          liveLabel.style.color = "#5fb3a3";
+          st.liveCache = { key: cacheKey, data: snapped };
+          return snapped;
+        }
+
+        liveLabel.textContent = "Live (edited preview)";
+        liveLabel.style.color = "#e0a458";
+        const reduced = getRawReduced();
+        if (!reduced) return null;
+        const { width: w, height: h, data: id } = reduced;
         const out = new ImageData(w, h);
         const paletteRGB = st.livePalette.map(hexToRgb);
         const workload = (w * h) * paletteRGB.length;
 
         if (workload > LUT_THRESHOLD) {
           const lut = buildPaletteLUT(paletteRGB);
-          for (let i = 0; i < id.data.length; i += 4) {
-            const idx = ((id.data[i] >> LUT_SHIFT) << (2 * LUT_BITS)) |
-                        ((id.data[i + 1] >> LUT_SHIFT) << LUT_BITS) |
-                        (id.data[i + 2] >> LUT_SHIFT);
+          for (let i = 0; i < id.length; i += 4) {
+            const idx = ((id[i] >> LUT_SHIFT) << (2 * LUT_BITS)) |
+                        ((id[i + 1] >> LUT_SHIFT) << LUT_BITS) |
+                        (id[i + 2] >> LUT_SHIFT);
             const best = lut[idx];
             out.data[i] = paletteRGB[best][0]; out.data[i + 1] = paletteRGB[best][1];
-            out.data[i + 2] = paletteRGB[best][2]; out.data[i + 3] = id.data[i + 3];
+            out.data[i + 2] = paletteRGB[best][2]; out.data[i + 3] = 255;
           }
         } else {
-          for (let i = 0; i < id.data.length; i += 4) {
+          for (let i = 0; i < id.length; i += 4) {
             let best = 0, bestD = Infinity;
-            const r = id.data[i], g = id.data[i + 1], b = id.data[i + 2];
+            const r = id[i], g = id[i + 1], b = id[i + 2];
             for (let p = 0; p < paletteRGB.length; p++) {
               const [pr, pg, pb] = paletteRGB[p];
               const d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
               if (d < bestD) { bestD = d; best = p; }
             }
             out.data[i] = paletteRGB[best][0]; out.data[i + 1] = paletteRGB[best][1];
-            out.data[i + 2] = paletteRGB[best][2]; out.data[i + 3] = id.data[i + 3];
+            out.data[i + 2] = paletteRGB[best][2]; out.data[i + 3] = 255;
           }
         }
+
+        // Mask-aware core processing locks background cells to one exact
+        // color. Preserve those same cells in the edited approximation by
+        // sampling the authoritative Snapped frame at each cell center.
+        if (st.backgroundHex && snapped) {
+          const [br, bg, bb] = hexToRgb(st.backgroundHex);
+          const snappedData = snapped.canvas.getContext("2d", { willReadFrequently: true })
+            .getImageData(0, 0, snapped.w, snapped.h).data;
+          for (let cy = 0; cy < h; cy++) {
+            const sy = Math.min(snapped.h - 1, Math.floor((cy + 0.5) * snapped.h / h));
+            for (let cx = 0; cx < w; cx++) {
+              const sx = Math.min(snapped.w - 1, Math.floor((cx + 0.5) * snapped.w / w));
+              const si = (sy * snapped.w + sx) * 4;
+              if (Math.abs(snappedData[si] - br) <= 1 &&
+                  Math.abs(snappedData[si + 1] - bg) <= 1 &&
+                  Math.abs(snappedData[si + 2] - bb) <= 1) {
+                const oi = (cy * w + cx) * 4;
+                out.data[oi] = br; out.data[oi + 1] = bg;
+                out.data[oi + 2] = bb; out.data[oi + 3] = 255;
+              }
+            }
+          }
+        }
+
         const c = document.createElement("canvas");
         c.width = w; c.height = h;
         c.getContext("2d").putImageData(out, 0, 0);
@@ -383,18 +541,31 @@ app.registerExtension({
               return;
             }
             st.livePalette.splice(i, 1);
+            st.paletteDirty = true;
             renderPaletteRow();
             redrawBox("live");
           });
           paletteRow.appendChild(sw);
         });
       }
-      function addColorToPalette(hex) {
-        hex = hex.toLowerCase();
+      function addColorToPalette(value) {
+        const hex = normalizeHex(value);
+        if (!hex) {
+          statusEl.textContent = `Invalid color "${value}" — use a six-digit value such as #ff8800.`;
+          return;
+        }
         if (!st.livePalette.some((h) => h.toLowerCase() === hex)) {
           st.livePalette.push(hex);
+          st.paletteDirty = true;
           renderPaletteRow();
           redrawBox("live");
+          // Best-effort hardening: if something in the host page's own
+          // render cycle (e.g. ComfyUI's newer Vue-based "Nodes 2.0"
+          // rendering, still beta) defers/batches DOM updates in a way
+          // that leaves an imperative canvas draw visually stale until
+          // the next reactive tick, forcing one more redraw on the next
+          // animation frame should catch it. Harmless no-op otherwise.
+          requestAnimationFrame(() => redrawBox("live"));
           statusEl.textContent = `Added ${hex} to the palette (${st.livePalette.length} colors).`;
         } else {
           statusEl.textContent = `${hex} is already in the palette.`;
@@ -411,6 +582,7 @@ app.registerExtension({
         });
         const removed = st.livePalette[best];
         st.livePalette.splice(best, 1);
+        st.paletteDirty = true;
         renderPaletteRow();
         redrawBox("live");
         statusEl.textContent = `Removed ${removed} from the palette (${st.livePalette.length} colors).`;
@@ -426,17 +598,77 @@ app.registerExtension({
         return best;
       }
       function updateReplaceApplyState() { replaceApplyBtn.disabled = st.replaceSource == null; }
-      function applyReplace(targetHex) {
+
+      // --- persistent "this color was intentionally replaced" memory ---
+      // Deliberately NOT encoded into the exported palette PNG/metadata:
+      // that would mean patching raw PNG chunk structure (real risk of a
+      // subtle encoding bug) and, more importantly, the core node's
+      // custom_palette loader just reads unique pixel colors from
+      // whatever image it's given — any extra encoded pixels would leak
+      // into the actual palette used for processing unless the Python
+      // side were also taught to ignore them. localStorage keeps this
+      // entirely on the editing side, with zero risk to the real
+      // pipeline, at the cost of not traveling with the file itself.
+      const SUBST_KEY = "vps_color_substitutions_v1";
+      function loadSubstitutions() {
+        try { return JSON.parse(localStorage.getItem(SUBST_KEY) || "[]"); }
+        catch (err) { return []; }
+      }
+      function saveSubstitutions(list) {
+        try { localStorage.setItem(SUBST_KEY, JSON.stringify(list.slice(-200))); }
+        catch (err) { log("failed to save substitution memory: " + (err?.message || err)); }
+      }
+      function recordSubstitution(fromHex, toHex) {
+        const list = loadSubstitutions();
+        const i = list.findIndex((r) => r.from === fromHex);
+        const entry = { from: fromHex, to: toHex, ts: Date.now() };
+        if (i >= 0) list[i] = entry; else list.push(entry);
+        saveSubstitutions(list);
+      }
+      function applySavedSubstitutions() {
+        const rules = loadSubstitutions();
+        if (!rules.length) { statusEl.textContent = "No saved substitutions yet — use Replace at least once first."; return; }
+        const THRESHOLD = 40; // RGB-space distance; a rough "close enough to be the same intended color" cutoff
+        let applied = 0;
+        rules.forEach((rule) => {
+          const [fr, fg, fb] = hexToRgb(rule.from);
+          let best = -1, bestD = Infinity;
+          st.livePalette.forEach((h, i) => {
+            const [pr, pg, pb] = hexToRgb(h);
+            const d = Math.hypot(fr - pr, fg - pg, fb - pb);
+            if (d < bestD) { bestD = d; best = i; }
+          });
+          if (best >= 0 && bestD <= THRESHOLD) { st.livePalette[best] = rule.to; applied++; }
+        });
+        if (applied) st.paletteDirty = true;
+        renderPaletteRow();
+        redrawBox("live");
+        statusEl.textContent = `Applied ${applied} of ${rules.length} saved substitution(s) ` +
+          `(others had no close-enough match in the current palette — that's expected on a very different scene).`;
+      }
+      wrap.querySelector(".vps-apply-saved-subst").addEventListener("click", applySavedSubstitutions);
+      wrap.querySelector(".vps-clear-saved-subst").addEventListener("click", () => {
+        saveSubstitutions([]);
+        statusEl.textContent = "Forgot all saved color substitutions.";
+      });
+
+      function applyReplace(value) {
         if (st.replaceSource == null || st.replaceSource >= st.livePalette.length) return;
+        const targetHex = normalizeHex(value);
+        if (!targetHex) {
+          statusEl.textContent = `Invalid replacement color "${value}" — use #rrggbb.`;
+          return;
+        }
         const idx = st.replaceSource;
         const oldHex = st.livePalette[idx];
-        targetHex = targetHex.toLowerCase();
         st.livePalette[idx] = targetHex;
+        st.paletteDirty = true;
         st.replaceSource = null;
+        recordSubstitution(oldHex, targetHex);
         renderPaletteRow();
         updateReplaceApplyState();
         redrawBox("live");
-        statusEl.textContent = `Replaced ${oldHex} → ${targetHex}.`;
+        statusEl.textContent = `Replaced ${oldHex} → ${targetHex}. Remembered — "Apply saved substitutions" will try to reapply this on future palettes.`;
       }
       function handleReplaceClick(hex) {
         if (!st.livePalette.length) return;
@@ -455,18 +687,29 @@ app.registerExtension({
         const img = await loadImage(refUrl(ref));
         const c = document.createElement("canvas");
         c.width = img.naturalWidth; c.height = img.naturalHeight;
-        const ctx = c.getContext("2d");
+        const ctx = c.getContext("2d", { willReadFrequently: true });
         ctx.drawImage(img, 0, 0);
         const y = Math.floor(c.height / 2);
         const row = ctx.getImageData(0, y, c.width, 1).data;
-        const seen = new Map();
-        const stepX = Math.max(1, Math.floor(c.width / 200));
-        for (let x = 0; x < c.width; x += stepX) {
+
+        // palette_preview is a horizontal strip of exact flat swatches.
+        // Scan the full row and keep first-seen order. The old every-Nth-
+        // pixel sampler could skip an entire 32 px swatch once the strip
+        // was wide, and its hard 64-color cap contradicted the core node's
+        // documented 256-color limit.
+        const colors = [];
+        const seen = new Set();
+        for (let x = 0; x < c.width; x++) {
           const i = x * 4;
+          if (row[i + 3] < 8) continue;
           const hex = rgbToHex(row[i], row[i + 1], row[i + 2]);
-          seen.set(hex, (seen.get(hex) || 0) + 1);
+          if (!seen.has(hex)) {
+            seen.add(hex);
+            colors.push(hex);
+            if (colors.length >= 256) break;
+          }
         }
-        return Array.from(seen.entries()).sort((a, b) => b[1] - a[1]).slice(0, 64).map(([h]) => h);
+        return colors;
       }
 
       // --- measure: two clicks on "Original" -> pixel_size = distance / target cells ---
@@ -643,6 +886,7 @@ app.registerExtension({
 
       wrap.querySelector(".vps-reset").addEventListener("click", () => {
         st.livePalette = st.originalPalette.slice();
+        st.paletteDirty = false;
         st.replaceSource = null;
         updateReplaceApplyState();
         renderPaletteRow();
@@ -695,6 +939,10 @@ app.registerExtension({
           const raw = message?.vps_raw || [];
           const frames = message?.vps_frames || [];
           const palette = message?.vps_palette;
+          // [block, phaseX, phaseY, cellsW?, cellsH?, scale?], only
+          // present when the editor's optional `info` input is connected.
+          const gridMsg = message?.vps_grid;
+          const backgroundMsg = message?.vps_background;
           if (!frames.length || !palette?.length) {
             internal.statusEl.textContent =
               "No preview in the node's output — open ComfyUI's Logs panel (Ctrl+`) and look for " +
@@ -707,14 +955,32 @@ app.registerExtension({
           node._vps.frameIdx = 0;
           node._vps.rawCache = {};
           node._vps.snappedCache = {};
+          node._vps.rawReducedCache = {};
+          node._vps.grid = Array.isArray(gridMsg) ? {
+            block: gridMsg[0], phaseX: gridMsg[1], phaseY: gridMsg[2],
+            cellsW: gridMsg[3] || null, cellsH: gridMsg[4] || null,
+            scale: gridMsg[5] || 1,
+          } : null;
+          node._vps.backgroundHex = Array.isArray(backgroundMsg)
+            ? (backgroundMsg[0] || null)
+            : (backgroundMsg || null);
           node._vps.liveCache = { key: null, data: null };
           node._vps.measurePoints = [];
           node._vps.view = { zoom: 1, panX: 0, panY: 0 };
           node._vps.originalPalette = await internal.loadPaletteFromRef(palette[0]);
-          node._vps.livePalette = node._vps.originalPalette.slice();
+          // Refresh an untouched working palette when k_colors, seed, the
+          // source clip, or custom_palette changes. Once the user edits it,
+          // preserve those edits across incidental ComfyUI re-executions;
+          // Reset explicitly accepts the newest auto palette again.
+          if (!node._vps.paletteDirty || !node._vps.livePalette.length) {
+            node._vps.livePalette = node._vps.originalPalette.slice();
+            node._vps.paletteDirty = false;
+          }
           internal.renderPaletteRow();
           await internal.goToFrame(0);
-          internal.statusEl.textContent = `${node._vps.livePalette.length} colors, ${frames.length} frame(s). Pick/Delete/Replace/Measure — click any preview.`;
+          internal.statusEl.textContent = `${node._vps.livePalette.length} colors, ${frames.length} frame(s). ` +
+            `Live exactly matches Snapped until the palette colors change. ` +
+            `Pick/Delete/Replace/Measure — click any preview.`;
           log(`node ${node.id}: preview loaded OK (${node._vps.livePalette.length} colors, ${frames.length} frames)`);
         } catch (err) {
           internal.statusEl.textContent = "Preview load failed: " + (err?.message || err);

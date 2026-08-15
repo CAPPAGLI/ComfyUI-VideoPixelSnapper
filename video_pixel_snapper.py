@@ -36,8 +36,105 @@ Install: drop this folder into ComfyUI/custom_nodes/ and restart ComfyUI.
 """
 
 import os
+import re
 import torch
 import torch.nn.functional as F
+
+
+def _drop_alpha(image: torch.Tensor) -> torch.Tensor:
+    """Normalize a ComfyUI IMAGE tensor to RGB."""
+    if image.shape[-1] > 3:
+        return image[..., :3]
+    return image
+
+
+def _prepare_mask(mask: torch.Tensor, batch: int, height: int, width: int,
+                  device, invert: bool = False) -> torch.Tensor:
+    """Normalize common ComfyUI MASK layouts to ``(B,H,W)`` float32.
+
+    A single mask is broadcast across a video batch; spatial mismatches are
+    resized with bilinear interpolation so masks from RMBG nodes remain usable
+    even when their preview/output size differs from the IMAGE input.
+    """
+    m = mask.to(device=device, dtype=torch.float32)
+    if m.ndim == 2:
+        m = m.unsqueeze(0)
+    elif m.ndim == 4:
+        if m.shape[-1] == 1:
+            m = m[..., 0]
+        elif m.shape[1] == 1:
+            m = m[:, 0]
+        else:
+            raise ValueError(f"foreground_mask must have one channel, got shape {tuple(m.shape)}")
+    if m.ndim != 3:
+        raise ValueError(f"foreground_mask must be (H,W), (B,H,W), or one-channel 4D; got {tuple(m.shape)}")
+
+    if m.shape[0] == 1 and batch > 1:
+        m = m.expand(batch, -1, -1)
+    elif m.shape[0] != batch:
+        raise ValueError(
+            f"foreground_mask batch ({m.shape[0]}) must be 1 or match image batch ({batch})"
+        )
+
+    if m.shape[1:] != (height, width):
+        m = F.interpolate(
+            m.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False
+        ).squeeze(1)
+    m = m.clamp(0.0, 1.0)
+    return 1.0 - m if invert else m
+
+
+def _sample_rows(flat: torch.Tensor, cap: int = 200_000) -> torch.Tensor:
+    """Deterministically cap rows before a robust median operation."""
+    if flat.shape[0] <= cap:
+        return flat
+    idx = torch.linspace(0, flat.shape[0] - 1, cap, device=flat.device).long()
+    return flat[idx]
+
+
+def _background_color(images: torch.Tensor, mask: torch.Tensor,
+                      sample_idx: torch.Tensor, mask_threshold: float,
+                      background_image: torch.Tensor = None) -> torch.Tensor:
+    """Return one robust RGB background representative.
+
+    ``background_image`` is preferred (wire the same Empty Image used for
+    compositing). Otherwise sample high-confidence masked-out pixels from the
+    input frames, which works well when the input is already composited onto a
+    flat color.
+    """
+    if background_image is not None:
+        bg = _drop_alpha(background_image.to(images.device)).reshape(-1, 3)
+        if bg.numel():
+            return _sample_rows(bg).median(dim=0).values.clamp(0.0, 1.0)
+
+    samples = images[sample_idx]
+    masks = mask[sample_idx]
+    high_confidence_bg = masks <= max(0.0, 1.0 - float(mask_threshold))
+    pixels = samples[high_confidence_bg]
+    if not pixels.numel():
+        pixels = samples[masks < 0.5]
+    if not pixels.numel():
+        return torch.zeros(3, device=images.device, dtype=images.dtype)
+    return _sample_rows(pixels.reshape(-1, 3)).median(dim=0).values.clamp(0.0, 1.0)
+
+
+def _ensure_background_color(palette: torch.Tensor, color: torch.Tensor,
+                             cap: int = 256):
+    """Ensure an exact, dedicated background entry and return its index."""
+    color = color.to(device=palette.device, dtype=palette.dtype).reshape(1, 3)
+    if palette.numel():
+        d = torch.cdist(color, palette).squeeze(0)
+        exact = torch.nonzero(d < 1e-7, as_tuple=False)
+        if exact.numel():
+            return palette, int(exact[0, 0].item())
+        if palette.shape[0] >= cap:
+            idx = int(torch.argmin(d).item())
+            palette = palette.clone()
+            palette[idx] = color[0]
+            return palette, idx
+    palette = torch.cat([palette, color], dim=0)
+    return palette, palette.shape[0] - 1
+
 
 # folder_paths / PIL only exist inside a real ComfyUI process. Import
 # defensively so the node still works (just without the live-editor
@@ -136,7 +233,13 @@ def _dominant_period(signal: torch.Tensor, min_period: int = 2, max_period: int 
 
 
 def _edge_signals(frame_hw3: torch.Tensor):
-    gray = frame_hw3.mean(dim=-1)
+    # Perceptual luma keeps equal-average RGB colors (pure red/green/blue
+    # all average to 1/3) distinguishable for grid detection.
+    gray = (
+        frame_hw3[..., 0] * 0.299
+        + frame_hw3[..., 1] * 0.587
+        + frame_hw3[..., 2] * 0.114
+    )
     col_edges = gray.diff(dim=1).abs().sum(dim=0)
     row_edges = gray.diff(dim=0).abs().sum(dim=1)
     return col_edges, row_edges
@@ -153,16 +256,23 @@ def estimate_pixel_size(frame_hw3: torch.Tensor, min_period: int = 2, max_period
 
 
 def _estimate_phase(edge_signal: torch.Tensor, period: int) -> int:
-    """Brute-force offset scan: same idea as unfake.js's findOptimalCrop —
-    try every offset 0..period-1, score = sum of edge energy at that stride,
-    keep the offset with the highest score."""
+    """Estimate the first cell's start coordinate for a fixed period.
+
+    ``edge_signal[i]`` represents the transition *between* source pixels
+    ``i`` and ``i + 1``. The strongest folded edge phase is therefore a
+    boundary index, while ``crop_bounds`` needs the first pixel *after*
+    that boundary. The ``+1`` is important: without it a perfectly aligned
+    8 px grid is reported as phase 7 and every reduction cell straddles two
+    real cells.
+    """
     period = max(1, int(period))
     n = edge_signal.shape[0]
     if period <= 1 or n < period:
         return 0
     trimmed_len = (n // period) * period
     folded = edge_signal[:trimmed_len].reshape(-1, period).sum(dim=0)
-    return int(torch.argmax(folded).item())
+    boundary_phase = int(torch.argmax(folded).item())
+    return (boundary_phase + 1) % period
 
 
 def estimate_phase_for_frame(frame_hw3: torch.Tensor, block: int):
@@ -199,14 +309,58 @@ def nearest_palette_index(flat: torch.Tensor, palette: torch.Tensor, chunk: int 
 #    outlines, eyes, highlights; near-zero on flat regions).
 # ----------------------------------------------------------------------
 
+def _masked_median(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Lower median over the penultimate dimension, ignoring invalid rows.
+
+    ``values`` is ``(..., samples, channels)`` and ``valid`` is
+    ``(..., samples)``. All-invalid groups return zero and are expected to be
+    rejected/overridden by their caller.
+    """
+    count = valid.sum(dim=-1)
+    masked = values.masked_fill(~valid.unsqueeze(-1), float("inf"))
+    ordered = masked.sort(dim=-2).values
+    median_pos = ((count - 1).clamp(min=0) // 2)
+    gather_idx = median_pos.unsqueeze(-1).unsqueeze(-1).expand(
+        *median_pos.shape, 1, values.shape[-1]
+    )
+    result = torch.gather(ordered, -2, gather_idx).squeeze(-2)
+    return torch.where((count > 0).unsqueeze(-1), result, torch.zeros_like(result))
+
+
 def cell_stats(frame_hw3: torch.Tensor, block: int, phase_y: int = 0, phase_x: int = 0):
     h, w, c = frame_hw3.shape
     y0, x0, ch, cw, oh, ow = crop_bounds(h, w, block, phase_y, phase_x)
     cropped = frame_hw3[y0:y0 + ch, x0:x0 + cw, :]
     blocks = cropped.reshape(oh, block, ow, block, c).permute(0, 2, 1, 3, 4).reshape(oh, ow, block * block, c)
     colors = blocks.median(dim=2).values
-    saliency = blocks.std(dim=2).mean(dim=-1)  # oh, ow
+    # unbiased=False keeps block=1 valid (the unbiased estimator returns
+    # NaN for a single sample, which previously poisoned palette weights).
+    saliency = blocks.std(dim=2, unbiased=False).mean(dim=-1)  # oh, ow
     return colors, saliency
+
+
+def masked_cell_stats(frame_hw3: torch.Tensor, mask_hw: torch.Tensor, block: int,
+                      phase_y: int, phase_x: int, mask_threshold: float):
+    """Cell colors/saliency computed only from confident foreground pixels."""
+    h, w, c = frame_hw3.shape
+    y0, x0, ch, cw, oh, ow = crop_bounds(h, w, block, phase_y, phase_x)
+    pixels = frame_hw3[y0:y0 + ch, x0:x0 + cw, :]
+    masks = mask_hw[y0:y0 + ch, x0:x0 + cw]
+    pixels = pixels.reshape(oh, block, ow, block, c).permute(0, 2, 1, 3, 4)
+    pixels = pixels.reshape(oh, ow, block * block, c)
+    mask_blocks = masks.reshape(oh, block, ow, block).permute(0, 2, 1, 3)
+    mask_blocks = mask_blocks.reshape(oh, ow, block * block)
+    valid = mask_blocks >= mask_threshold
+    count = valid.sum(dim=-1)
+    colors = _masked_median(pixels, valid)
+
+    weights = valid.to(pixels.dtype).unsqueeze(-1)
+    denom = weights.sum(dim=-2).clamp(min=1.0)
+    mean = (pixels * weights).sum(dim=-2) / denom
+    var = ((pixels - mean.unsqueeze(-2)) ** 2 * weights).sum(dim=-2) / denom
+    saliency = var.clamp(min=0.0).sqrt().mean(dim=-1)
+    coverage = mask_blocks.mean(dim=-1)
+    return colors, saliency, coverage, count
 
 
 # ----------------------------------------------------------------------
@@ -233,6 +387,17 @@ def kmeans(pixels: torch.Tensor, k: int, iters: int = 25, seed: int = 42) -> tor
             break
         centers = new_centers
     return centers
+
+
+def deduplicate_palette(palette: torch.Tensor, tolerance: float = 1e-5) -> torch.Tensor:
+    """Preserve order while dropping duplicate/near-identical centers."""
+    if palette.shape[0] < 2:
+        return palette
+    chosen = [0]
+    for i in range(1, palette.shape[0]):
+        if float(torch.cdist(palette[i:i + 1], palette[chosen]).min()) > tolerance:
+            chosen.append(i)
+    return palette[chosen]
 
 
 def farthest_point_select(candidates: torch.Tensor, scores: torch.Tensor, k: int) -> torch.Tensor:
@@ -273,7 +438,7 @@ def build_palette(pool_colors: torch.Tensor, pool_saliency: torch.Tensor, k_colo
     bulk = kmeans(weighted_pool, k_bulk, seed=seed)
 
     if accent_slots == 0:
-        return bulk
+        return deduplicate_palette(bulk)
 
     # candidates for reservation: cells whose color the bulk palette does
     # NOT already represent well, ranked by (distance from bulk) x (saliency)
@@ -288,7 +453,7 @@ def build_palette(pool_colors: torch.Tensor, pool_saliency: torch.Tensor, k_colo
         prior = palette[:i][keep_mask[:i]]
         if prior.shape[0] and float(torch.cdist(palette[i:i+1], prior).min()) < 1e-3:
             keep_mask[i] = False
-    return palette[keep_mask]
+    return deduplicate_palette(palette[keep_mask])
 
 
 def palette_from_image(custom_palette: torch.Tensor, cap: int, seed: int) -> torch.Tensor:
@@ -331,29 +496,47 @@ def _cell_kernel(block: int, kind: str, device) -> torch.Tensor:
 
 
 def weighted_vote_reduce(cropped: torch.Tensor, block: int, palette: torch.Tensor, kind: str,
-                          margin: float = 0.05):
+                         margin: float = 0.05, pixel_mask: torch.Tensor = None):
     b, ch, cw, c = cropped.shape
     oh, ow = ch // block, cw // block
+
+    # A 1x1 cell has nothing to vote over.
+    if block == 1:
+        return nearest_palette_index(cropped.reshape(-1, c), palette).reshape(b, oh, ow)
+
     n_cells = b * oh * ow
+    pixels = cropped.reshape(b, oh, block, ow, block, c).permute(0, 1, 3, 2, 4, 5)
+    pixels = pixels.reshape(n_cells, block * block, c)
+    idx_px = nearest_palette_index(cropped.reshape(-1, c), palette)
+    idx_px = idx_px.reshape(b, oh, block, ow, block).permute(0, 1, 3, 2, 4)
+    idx_px = idx_px.reshape(n_cells, block * block)
 
-    flat_px = cropped.reshape(-1, c)
-    idx_px = nearest_palette_index(flat_px, palette)
-    idx_px = idx_px.reshape(b, oh, block, ow, block).permute(0, 1, 3, 2, 4).reshape(n_cells, block * block)
+    kernel = _cell_kernel(block, kind, cropped.device).unsqueeze(0)
+    valid = None
+    if pixel_mask is not None:
+        valid = pixel_mask.reshape(b, oh, block, ow, block).permute(0, 1, 3, 2, 4)
+        valid = valid.reshape(n_cells, block * block)
+        vote_weights = kernel * valid.to(cropped.dtype)
+    else:
+        vote_weights = kernel.expand(n_cells, -1)
 
-    weights = _cell_kernel(block, kind, cropped.device)
     k = palette.shape[0]
     hist = torch.zeros(n_cells, k, device=cropped.device)
-    hist.scatter_add_(1, idx_px, weights.unsqueeze(0).expand(n_cells, -1))
+    hist.scatter_add_(1, idx_px, vote_weights)
 
     top2 = hist.topk(min(2, k), dim=1)
-    total = hist.sum(dim=1).clamp(min=1e-8)
+    raw_total = hist.sum(dim=1)
+    total = raw_total.clamp(min=1e-8)
     winner_idx = top2.indices[:, 0]
     share_top = top2.values[:, 0] / total
     share_second = (top2.values[:, 1] / total) if k > 1 else torch.zeros_like(share_top)
-    ambiguous = (share_top - share_second) < margin
+    ambiguous = ((share_top - share_second) < margin) | (raw_total <= 0)
 
-    mean_rgb = cropped.reshape(b, oh, block, ow, block, c).permute(0, 1, 3, 2, 4, 5)
-    mean_rgb = mean_rgb.reshape(n_cells, block * block, c).mean(dim=1)
+    if valid is None:
+        mean_rgb = pixels.mean(dim=1)
+    else:
+        mask_f = valid.to(cropped.dtype).unsqueeze(-1)
+        mean_rgb = (pixels * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
     fallback_idx = nearest_palette_index(mean_rgb, palette)
 
     final_idx = torch.where(ambiguous, fallback_idx, winner_idx)
@@ -382,8 +565,15 @@ def despeckle_indices(idx_grid: torch.Tensor, k_colors: int) -> torch.Tensor:
     # replacement = mode of the 4 neighbors
     stacked = torch.stack([up, down, left, right], dim=0)  # 4,b,oh,ow
     stacked_l = stacked.long().permute(1, 2, 3, 0).reshape(-1, 4)
-    mode_val = torch.mode(stacked_l, dim=1).values.reshape(b, oh, ow).float()
-    out = torch.where(disagree, mode_val, center)
+    mode_flat = torch.mode(stacked_l, dim=1).values
+    mode_count = (stacked_l == mode_flat.unsqueeze(1)).sum(dim=1).reshape(b, oh, ow)
+    mode_val = mode_flat.reshape(b, oh, ow).float()
+
+    # If all four neighbors are different, torch.mode resolves the tie by
+    # palette-index order; replacing with that arbitrary color creates a
+    # new artifact. Require at least two neighbors to agree.
+    should_replace = disagree & (mode_count >= 2)
+    out = torch.where(should_replace, mode_val, center)
     return out.long().clamp(0, k_colors - 1)
 
 
@@ -392,36 +582,104 @@ def despeckle_indices(idx_grid: torch.Tensor, k_colors: int) -> torch.Tensor:
 # ----------------------------------------------------------------------
 
 def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, palette: torch.Tensor,
-                   cell_method: str, dither: str, despeckle: bool,
-                   out_h: int, out_w: int) -> torch.Tensor:
+                  cell_method: str, dither: str, despeckle: bool,
+                  out_h: int, out_w: int, foreground_mask: torch.Tensor = None,
+                  mask_threshold: float = 0.5, mask_cell_threshold: float = 0.25,
+                  background_index: int = None) -> torch.Tensor:
+    """Apply one fixed grid/palette, automatically chunking long clips.
+
+    ``nearest_palette_index`` already chunks its distance matrix, but the
+    majority methods also allocate a per-cell palette histogram. Processing
+    a whole long video at once made that tensor scale with frame count and
+    could OOM even though each frame was individually modest. This keeps the
+    exact same result while bounding those per-frame temporaries.
+    """
     b, h, w, c = images.shape
     y0, x0, ch, cw, oh, ow = crop_bounds(h, w, block, phase_y, phase_x)
-    cropped = images[:, y0:y0 + ch, x0:x0 + cw, :]
     k = palette.shape[0]
 
+    if cell_method in ("majority", "center_weighted") and block > 1:
+        # Roughly cap the largest histogram at ~8M float elements (~32 MB).
+        per_frame_hist = max(1, oh * ow * k)
+        frames_per_chunk = max(1, min(16, 8_000_000 // per_frame_hist))
+    else:
+        # Other methods have no cell x palette histogram; source pixels are
+        # the dominant temporary, so a looser pixel budget is sufficient.
+        per_frame_pixels = max(1, ch * cw)
+        frames_per_chunk = max(1, min(32, 8_000_000 // per_frame_pixels))
+
+    dither_tile = None
     if dither != "none":
-        cropped = cropped + _bayer_tile(dither, ch, cw, images.device) * dither_strength(palette)
+        dither_tile = _bayer_tile(dither, ch, cw, images.device) * dither_strength(palette)
 
-    if cell_method in ("majority", "center_weighted"):
-        idx_grid = weighted_vote_reduce(cropped, block, palette, cell_method)
-    elif cell_method == "center":
-        cy, cx = block // 2, block // 2
-        sampled = cropped[:, cy::block, cx::block, :][:, :oh, :ow, :]
-        idx_grid = nearest_palette_index(sampled.reshape(-1, c), palette).reshape(b, oh, ow)
-    else:  # median
-        blocks = cropped.reshape(b, oh, block, ow, block, c).permute(0, 1, 3, 2, 4, 5)
-        down = blocks.reshape(b, oh, ow, block * block, c).median(dim=3).values
-        idx_grid = nearest_palette_index(down.reshape(-1, c), palette).reshape(b, oh, ow)
+    outputs = []
+    for start in range(0, b, frames_per_chunk):
+        end = min(start + frames_per_chunk, b)
+        cropped = images[start:end, y0:y0 + ch, x0:x0 + cw, :]
+        cb = end - start
 
-    if despeckle:
-        idx_grid = despeckle_indices(idx_grid, k)
+        pixel_mask = None
+        foreground_cells = None
+        if foreground_mask is not None:
+            mask_crop = foreground_mask[start:end, y0:y0 + ch, x0:x0 + cw]
+            mask_blocks = mask_crop.reshape(cb, oh, block, ow, block).permute(0, 1, 3, 2, 4)
+            mask_blocks = mask_blocks.reshape(cb, oh, ow, block * block)
+            pixel_mask_cells = mask_blocks >= mask_threshold
+            foreground_cells = (
+                (mask_blocks.mean(dim=-1) >= mask_cell_threshold)
+                & pixel_mask_cells.any(dim=-1)
+            )
+            # weighted_vote_reduce expects source-resolution mask layout.
+            pixel_mask = mask_crop >= mask_threshold
 
-    mapped = palette[idx_grid].clamp(0.0, 1.0)  # b, oh, ow, c
+        if dither_tile is not None:
+            cropped = cropped + dither_tile
 
-    mapped = mapped.permute(0, 3, 1, 2)
-    mapped = F.interpolate(mapped, size=(out_h, out_w), mode="nearest")
-    mapped = mapped.permute(0, 2, 3, 1)
-    return mapped
+        if cell_method in ("majority", "center_weighted"):
+            idx_grid = weighted_vote_reduce(
+                cropped, block, palette, cell_method, pixel_mask=pixel_mask
+            )
+        elif cell_method == "center":
+            cy, cx = block // 2, block // 2
+            sampled = cropped[:, cy::block, cx::block, :][:, :oh, :ow, :]
+            idx_grid = nearest_palette_index(sampled.reshape(-1, c), palette).reshape(cb, oh, ow)
+            if pixel_mask is not None:
+                center_valid = pixel_mask[:, cy::block, cx::block][:, :oh, :ow]
+                pixels = cropped.reshape(cb, oh, block, ow, block, c).permute(0, 1, 3, 2, 4, 5)
+                pixels = pixels.reshape(cb, oh, ow, block * block, c)
+                valid = pixel_mask_cells
+                mask_f = valid.to(cropped.dtype).unsqueeze(-1)
+                mean = (pixels * mask_f).sum(dim=3) / mask_f.sum(dim=3).clamp(min=1.0)
+                fallback = nearest_palette_index(mean.reshape(-1, c), palette).reshape(cb, oh, ow)
+                idx_grid = torch.where(center_valid, idx_grid, fallback)
+        else:  # median
+            blocks = cropped.reshape(cb, oh, block, ow, block, c).permute(0, 1, 3, 2, 4, 5)
+            blocks = blocks.reshape(cb, oh, ow, block * block, c)
+            if pixel_mask is None:
+                down = blocks.median(dim=3).values
+            else:
+                down = _masked_median(blocks, pixel_mask_cells)
+            idx_grid = nearest_palette_index(down.reshape(-1, c), palette).reshape(cb, oh, ow)
+
+        if despeckle:
+            idx_grid = despeckle_indices(idx_grid, k)
+
+        if foreground_cells is not None:
+            if background_index is None:
+                raise ValueError("background_index is required when foreground_mask is used")
+            idx_grid = torch.where(
+                foreground_cells,
+                idx_grid,
+                torch.full_like(idx_grid, int(background_index)),
+            )
+
+        mapped = palette[idx_grid].clamp(0.0, 1.0)  # cb, oh, ow, c
+        mapped = F.interpolate(
+            mapped.permute(0, 3, 1, 2), size=(out_h, out_w), mode="nearest"
+        ).permute(0, 2, 3, 1)
+        outputs.append(mapped)
+
+    return torch.cat(outputs, dim=0)
 
 
 def resolve_output_size(oh: int, ow: int, orig_h: int, orig_w: int, mode: str, manual_scale: int):
@@ -441,7 +699,7 @@ def resolve_output_size(oh: int, ow: int, orig_h: int, orig_w: int, mode: str, m
 # ----------------------------------------------------------------------
 
 class VideoPixelSnapper:
-    CATEGORY = "image/transform"
+    CATEGORY = "Video Pixel Snapper"
     RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
     RETURN_NAMES = ("image", "palette_preview", "info")
     FUNCTION = "run"
@@ -482,22 +740,56 @@ class VideoPixelSnapper:
                                                     "the ORIGINAL video's width / height / total pixel count."}),
                 "output_scale": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2 ** 31 - 1}),
+                "mask_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                                              "tooltip": "Used only when foreground_mask is connected. Pixels "
+                                                          "at or above this value may contribute to the foreground "
+                                                          "palette/cell vote; softer fringe pixels are excluded."}),
+                "mask_cell_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
+                                                   "tooltip": "Minimum average foreground coverage for an output "
+                                                               "grid cell. Lower preserves thinner silhouette details; "
+                                                               "higher removes more edge/background contamination."}),
+                "invert_mask": ("BOOLEAN", {"default": False,
+                                              "tooltip": "Enable when white means background in your mask. "
+                                                          "BiRefNet/RMBG normally uses white as foreground."}),
             },
             "optional": {
                 "custom_palette": ("IMAGE", {"tooltip": "Optional fixed palette, fed in as an image (e.g. a "
                                                           "swatch strip, or this node's own palette_preview "
                                                           "output after you edit it). Unique colors are read "
                                                           "from it directly, k_colors/accent_slots are ignored."}),
+                "foreground_mask": ("MASK", {"tooltip": "Optional foreground mask from BiRefNet/RMBG. Masked-out "
+                                                        "pixels are excluded from foreground palette estimation "
+                                                        "and collapsed to one locked background color."}),
+                "background_image": ("IMAGE", {"tooltip": "Optional flat Empty Image used as the background. Its "
+                                                          "median color becomes the single locked background entry. "
+                                                          "If omitted, background color is sampled from masked-out "
+                                                          "pixels of image."}),
             },
         }
 
     def run(self, image, pixel_size, grid_detection_mode, cell_method, k_colors, accent_slots,
-            sample_frames, dither, despeckle, output_scale_mode, output_scale, seed, custom_palette=None):
+            sample_frames, dither, despeckle, output_scale_mode, output_scale, seed,
+            mask_threshold=0.5, mask_cell_threshold=0.25, invert_mask=False,
+            custom_palette=None, foreground_mask=None, background_image=None):
+        image = _drop_alpha(image)
+        if custom_palette is not None:
+            custom_palette = _drop_alpha(custom_palette)
+        if background_image is not None:
+            background_image = _drop_alpha(background_image)
         b, h, w, c = image.shape
         device = image.device
+        mask_threshold = float(max(0.0, min(1.0, mask_threshold)))
+        mask_cell_threshold = float(max(0.0, min(1.0, mask_cell_threshold)))
+        prepared_mask = None
+        if foreground_mask is not None:
+            prepared_mask = _prepare_mask(
+                foreground_mask, b, h, w, device, invert=bool(invert_mask)
+            )
 
         n_samples = min(sample_frames, b)
-        sample_idx = torch.linspace(0, b - 1, n_samples).round().long().unique()
+        sample_idx = torch.linspace(
+            0, b - 1, n_samples, device=device
+        ).round().long().unique()
         samples = image[sample_idx]
 
         # --- grid SIZE ---
@@ -514,7 +806,11 @@ class VideoPixelSnapper:
                     estimates.append(est)
             estimates.sort()
             block = int(round(estimates[len(estimates) // 2])) if estimates else 1
-        block = max(1, min(block, h // 2, w // 2))
+        # Keep at least one complete cell even for tiny synthetic/test
+        # images; the previous h//2,w//2 clamp could turn block into 0
+        # when either dimension was 1.
+        max_block = max(1, min(h, w) // 2)
+        block = max(1, min(block, max_block))
 
         # --- grid PHASE ---
         if grid_detection_mode == "first_frame":
@@ -529,24 +825,61 @@ class VideoPixelSnapper:
             phase_y = int(torch.mode(torch.tensor(phase_ys)).values.item())
 
         # --- palette ---
+        background_index = None
+        background_rgb = None
+        if prepared_mask is not None:
+            background_rgb = _background_color(
+                image, prepared_mask, sample_idx, mask_threshold, background_image
+            )
+
         if custom_palette is not None:
             palette = palette_from_image(custom_palette.to(device), cap=256, seed=seed)
-            palette_source = f"custom ({palette.shape[0]} colors)"
+            if background_rgb is not None:
+                palette, background_index = _ensure_background_color(palette, background_rgb)
+                palette_source = f"custom+masked-bg ({palette.shape[0]} colors)"
+            else:
+                palette_source = f"custom ({palette.shape[0]} colors)"
         else:
             pools_c, pools_s = [], []
-            for i in range(samples.shape[0]):
-                col, sal = cell_stats(samples[i], block, phase_y, phase_x)
-                pools_c.append(col.reshape(-1, c))
-                pools_s.append(sal.reshape(-1))
-            pool_colors = torch.cat(pools_c, dim=0)
-            pool_saliency = torch.cat(pools_s, dim=0)
-            if pool_colors.shape[0] > 20000:
-                g = torch.Generator(device="cpu").manual_seed(seed)
-                keep = torch.randperm(pool_colors.shape[0], generator=g)[:20000].to(device)
-                pool_colors, pool_saliency = pool_colors[keep], pool_saliency[keep]
-            palette = build_palette(pool_colors, pool_saliency, k_colors, accent_slots, seed)
-            n_accent = max(0, palette.shape[0] - (k_colors - accent_slots))
-            palette_source = f"auto ({palette.shape[0]} colors, {n_accent} accent)"
+            if prepared_mask is None:
+                for i in range(samples.shape[0]):
+                    col, sal = cell_stats(samples[i], block, phase_y, phase_x)
+                    pools_c.append(col.reshape(-1, c))
+                    pools_s.append(sal.reshape(-1))
+            else:
+                sample_masks = prepared_mask[sample_idx]
+                for i in range(samples.shape[0]):
+                    col, sal, _coverage, count = masked_cell_stats(
+                        samples[i], sample_masks[i], block, phase_y, phase_x, mask_threshold
+                    )
+                    valid_cells = count > 0
+                    if valid_cells.any():
+                        pools_c.append(col[valid_cells])
+                        pools_s.append(sal[valid_cells])
+
+            if pools_c:
+                pool_colors = torch.cat(pools_c, dim=0)
+                pool_saliency = torch.cat(pools_s, dim=0)
+                if pool_colors.shape[0] > 20000:
+                    g = torch.Generator(device="cpu").manual_seed(seed)
+                    keep = torch.randperm(pool_colors.shape[0], generator=g)[:20000].to(device)
+                    pool_colors, pool_saliency = pool_colors[keep], pool_saliency[keep]
+
+                foreground_k = max(1, k_colors - 1) if prepared_mask is not None else k_colors
+                foreground_accents = min(accent_slots, max(0, foreground_k - 1))
+                palette = build_palette(
+                    pool_colors, pool_saliency, foreground_k, foreground_accents, seed
+                )
+                n_accent = max(0, palette.shape[0] - (foreground_k - foreground_accents))
+            else:
+                palette = image.new_empty((0, 3))
+                n_accent = 0
+
+            if background_rgb is not None:
+                palette, background_index = _ensure_background_color(palette, background_rgb)
+                palette_source = f"auto masked ({palette.shape[0]} colors, {n_accent} accent, 1 bg)"
+            else:
+                palette_source = f"auto ({palette.shape[0]} colors, {n_accent} accent)"
 
         # --- output size ---
         oh = (h - phase_y % block) // block
@@ -554,10 +887,23 @@ class VideoPixelSnapper:
         out_h, out_w, resolved_scale = resolve_output_size(oh, ow, h, w, output_scale_mode, output_scale)
 
         # --- apply ---
-        out = process_batch(image, block, phase_y, phase_x, palette, cell_method, dither, despeckle, out_h, out_w)
+        out = process_batch(
+            image, block, phase_y, phase_x, palette, cell_method, dither,
+            despeckle, out_h, out_w, foreground_mask=prepared_mask,
+            mask_threshold=mask_threshold, mask_cell_threshold=mask_cell_threshold,
+            background_index=background_index,
+        )
         preview = make_palette_preview(palette)
+        mask_info = ""
+        if prepared_mask is not None:
+            bg8 = (background_rgb.clamp(0.0, 1.0) * 255).round().long().tolist()
+            mask_info = (
+                f" mask=on bg=#{bg8[0]:02x}{bg8[1]:02x}{bg8[2]:02x} "
+                f"mask_threshold={mask_threshold:g} cell_threshold={mask_cell_threshold:g}"
+            )
         info = (f"grid={block}px phase=({phase_x},{phase_y}) cells={ow}x{oh} "
-                f"palette={palette_source} scale={resolved_scale}x -> {out_w}x{out_h}")
+                f"source={w}x{h} palette={palette_source} "
+                f"scale={resolved_scale}x -> {out_w}x{out_h}{mask_info}")
 
         return (out, preview, info)
 
@@ -576,7 +922,7 @@ class VideoPixelSnapperEditor:
     `palette_preview` output -> palette_preview.
     """
 
-    CATEGORY = "image/transform"
+    CATEGORY = "Video Pixel Snapper"
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     FUNCTION = "run"
@@ -594,14 +940,54 @@ class VideoPixelSnapperEditor:
                                                             "widget can page through. Each one is written as a "
                                                             "PNG file for the browser to fetch, so pushing this "
                                                             "very high on a big batch costs real disk/time."}),
-            }
+            },
+            "optional": {
+                "info": ("STRING", {"forceInput": True,
+                                     "tooltip": "Optional but recommended: connect Video Pixel Snapper's `info` "
+                                                 "output here. Lets Live use the exact grid size, phase, cell "
+                                                 "dimensions, and output scale. Without it, Live falls back to "
+                                                 "a centered best-effort reduction."}),
+            },
         }
 
-    def run(self, original_image, snapped_image, palette_preview, max_preview_frames):
+    def run(self, original_image, snapped_image, palette_preview, max_preview_frames, info=""):
+        original_image = _drop_alpha(original_image)
+        snapped_image = _drop_alpha(snapped_image)
+        palette_preview = _drop_alpha(palette_preview)
+
         raw_refs = _save_preview_images(original_image, "VPS_raw", max_frames=max_preview_frames)
         frame_refs = _save_preview_images(snapped_image, "VPS_frame", max_frames=max_preview_frames)
         palette_refs = _save_preview_images(palette_preview, "VPS_palette", max_frames=1)
+
+        grid = None
+        if info:
+            # Keep this as a compact numeric array because ComfyUI passes
+            # values in the ``ui`` payload straight to the frontend. The
+            # first three entries retain compatibility with the original
+            # format; cell dimensions and scale let the editor reduce RAW
+            # frames at the true cell resolution even when the core output
+            # has been nearest-neighbor upscaled.
+            m = re.search(
+                r"grid=(\d+)px phase=\((\d+),(\d+)\) cells=(\d+)x(\d+).*?scale=(\d+)x",
+                info,
+            )
+            if m:
+                grid = [int(v) for v in m.groups()]
+                # [block, phase_x, phase_y, cells_w, cells_h, output_scale]
+            else:
+                # Backward-compatible fallback for info strings produced
+                # by older versions that did not report cells/scale.
+                m = re.search(r"grid=(\d+)px phase=\((\d+),(\d+)\)", info)
+                if m:
+                    grid = [int(v) for v in m.groups()]
+
         ui_data = {"vps_raw": raw_refs, "vps_frames": frame_refs, "vps_palette": palette_refs}
+        if grid:
+            ui_data["vps_grid"] = grid
+        if info:
+            bg_match = re.search(r"mask=on bg=(#[0-9a-fA-F]{6})", info)
+            if bg_match:
+                ui_data["vps_background"] = [bg_match.group(1).lower()]
         return {"ui": ui_data, "result": (snapped_image,)}
 
 
