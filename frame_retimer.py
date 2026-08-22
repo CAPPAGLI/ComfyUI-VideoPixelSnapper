@@ -45,8 +45,10 @@ except Exception:
 
 class VideoPixelSnapperFrameRetimer:
     CATEGORY = "Video Pixel Snapper"
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "info")
+    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE", "MASK")
+    RETURN_NAMES = (
+        "image", "info", "transparent_image", "transparency_mask"
+    )
     FUNCTION = "run"
 
     @classmethod
@@ -79,7 +81,14 @@ class VideoPixelSnapperFrameRetimer:
         }
 
     def run(self, image, sequence_json, source_fps, max_preview_frames):
+        alpha = (
+            image[..., 3].float().clamp(0.0, 1.0)
+            if image.shape[-1] > 3 else torch.ones(
+                image.shape[:3], device=image.device, dtype=image.dtype
+            )
+        )
         image = _drop_alpha(image)
+        transparent_input = torch.cat([image, alpha.unsqueeze(-1)], dim=-1)
         n = image.shape[0]
         try:
             parsed = json.loads(sequence_json) if sequence_json else []
@@ -94,12 +103,14 @@ class VideoPixelSnapperFrameRetimer:
 
         idx_tensor = torch.tensor(seq, dtype=torch.long, device=image.device)
         out = image[idx_tensor]
+        transparent_out = transparent_input[idx_tensor]
+        transparency_mask = 1.0 - transparent_out[..., 3]
         info = f"{n} input frame(s) -> {out.shape[0]} output frame(s)"
         if source_fps and source_fps > 0:
             info += f" (~{out.shape[0] / source_fps:.2f}s @ {source_fps:g}fps)"
 
         if _save_preview_images is None:
-            return (out, info)
+            return (out, info, transparent_out, transparency_mask)
 
         input_refs = _save_preview_images(image, "VPS_retime_in", max_frames=max_preview_frames)
         # Thumbnails can be capped by max_preview_frames, but the true
@@ -108,7 +119,7 @@ class VideoPixelSnapperFrameRetimer:
         # thumbnail for it — see frame_retimer.js for how this is used.
         return {
             "ui": {"vps_retimer_frames": input_refs, "vps_total_frames": [n], "vps_source_fps": [source_fps]},
-            "result": (out, info),
+            "result": (out, info, transparent_out, transparency_mask),
         }
 
 

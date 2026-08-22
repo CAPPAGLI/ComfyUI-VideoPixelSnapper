@@ -10,9 +10,17 @@ from .temporal_denoise import (
     NODE_CLASS_MAPPINGS as _DENOISE_CLASSES,
     NODE_DISPLAY_NAME_MAPPINGS as _DENOISE_NAMES,
 )
+from .sprite_sheet import (
+    NODE_CLASS_MAPPINGS as _SHEET_CLASSES,
+    NODE_DISPLAY_NAME_MAPPINGS as _SHEET_NAMES,
+)
 
-NODE_CLASS_MAPPINGS = {**_VPS_CLASSES, **_RETIMER_CLASSES, **_DENOISE_CLASSES}
-NODE_DISPLAY_NAME_MAPPINGS = {**_VPS_NAMES, **_RETIMER_NAMES, **_DENOISE_NAMES}
+NODE_CLASS_MAPPINGS = {
+    **_VPS_CLASSES, **_RETIMER_CLASSES, **_DENOISE_CLASSES, **_SHEET_CLASSES
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    **_VPS_NAMES, **_RETIMER_NAMES, **_DENOISE_NAMES, **_SHEET_NAMES
+}
 
 # Serves everything under ./web/ (video_pixel_snapper.js, frame_retimer.js)
 # as a ComfyUI frontend extension. Standard, long-standing convention for

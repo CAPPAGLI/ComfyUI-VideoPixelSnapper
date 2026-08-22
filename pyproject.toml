@@ -1,7 +1,7 @@
 [project]
 name = "video-pixel-snapper"  # TODO: must be globally unique on the registry; change if taken. Immutable after first publish.
 description = "Batch/video-aware pixel-art snapper for ComfyUI: stable grid + palette across a whole clip, plus an in-graph live palette editor."
-version = "1.7.1"
+version = "2.0.0"
 license = { file = "LICENSE" }
 dependencies = []  # torch/numpy/Pillow are already provided by ComfyUI itself
 

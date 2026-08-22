@@ -35,6 +35,11 @@ palette edits.
 - **`despeckle`**: removes isolated single-cell noise.
 - **Flexible output sizing**: `manual` scale, or auto-match the
   original video's width / height / total pixel count.
+- **Hard-alpha PNG output**: transparent mode keeps an invisible internal
+  background key for temporal topology while exporting exact 0/1 alpha—no
+  second background-removal pass and no soft fringe.
+- **RGBA sprite sheets**: a focused row-major assembler preserves every frame
+  and alpha value without resizing or blending.
 - **Motion-aware discrete cleanup**: estimates bidirectional motion from
   the original video, rejects occlusions/flow errors, and stabilizes palette
   labels along trajectories without RGB blending—including external outlines,
@@ -50,6 +55,7 @@ ComfyUI/custom_nodes/ComfyUI-VideoPixelSnapper/
 ├── video_pixel_snapper.py
 ├── frame_retimer.py
 ├── temporal_denoise.py
+├── sprite_sheet.py
 └── web/
     ├── video_pixel_snapper.js
     └── frame_retimer.js
@@ -102,50 +108,51 @@ unique colors and `k_colors`/`accent_slots` are ignored.
 
 ### Background removal / foreground-mask wiring
 
-For BiRefNet/RMBG workflows, the cleanest setup is:
+For transparent BiRefNet/RMBG workflows, use:
 
 ```text
-original video IMAGE ─────────────────────> Video Pixel Snapper.image
-BiRefNet/RMBG foreground MASK ────────────> Video Pixel Snapper.foreground_mask
-Empty Image (your flat background color) ─> Video Pixel Snapper.background_image
+original video IMAGE ───────────> Video Pixel Snapper.image
+BiRefNet/RMBG foreground MASK ──> Video Pixel Snapper.foreground_mask
+background_mode = transparent
+background_image = disconnected
 ```
 
-**Feed the original RGB video—not the RMBG cutout—to `image`.** Connect only
-BiRefNet/RMBG's MASK output to `foreground_mask`, and connect the desired flat
-`Empty Image` to `background_image`. This avoids feeding white/transparent
-RMBG fringe pixels into foreground palette reduction. If random white cells
-are already visible immediately after RMBG and no Cleanup diagnostic marks
-them, Cleanup did not create them and cannot reliably infer their original
-color.
+**Feed the original RGB video—not the RMBG cutout—to `image`.** This prevents
+white/partially composited RMBG fringe from entering foreground color
+reduction. Transparent mode requires the mask and produces hard cell alpha:
+each output pixel is exactly opaque or transparent.
 
-A pre-composited/cutout IMAGE can still work when its edge colors are clean,
-but it is not the recommended wiring. The node uses confident mask pixels for
-palette estimation and cell voting, then writes one exact background color to
-every masked-out grid cell.
+Motion Cleanup still needs a discrete background label for silhouette voting.
+Transparent mode therefore chooses an internal 8-bit RGB key absent from the
+foreground palette, writes it under transparent pixels, and reports it in
+`info`. The key is invisible in `transparent_image` and prevents a real black
+or other foreground color from being mistaken for background.
 
+- `background_mode=solid` preserves the old behavior and optional
+  `background_image` flat color.
+- `background_mode=transparent` ignores visual background appearance and uses
+  the invisible unique key. `background_image` is not needed.
 - `mask_threshold` (default `0.5`) controls which source pixels may influence
   foreground colors. Raise it toward `0.7–0.9` if soft RMBG fringe colors
   still leak in.
-- `mask_cell_threshold` (default `0.25`) controls silhouette coverage at cell
-  level. Lower values preserve thin details; higher values remove more edge
-  contamination.
+- `mask_cell_threshold` (default `0.25`) controls hard silhouette coverage at
+  cell level. Lower values preserve thin details; higher values remove more
+  edge contamination.
 - `invert_mask` handles nodes where white means background. BiRefNet/RMBG
   normally outputs white foreground, so leave it off first.
-- If `background_image` is omitted, the node samples one background color
-  from high-confidence masked-out pixels in `image`.
 
-The output remains RGB with a solid background; this feature does not create
-an alpha-channel output. The Live Editor preserves locked background cells
-when it produces an edited approximation.
+The original `image` output remains RGB for compatibility. Use the appended
+RGBA `transparent_image` for Cleanup and export. `transparency_mask` follows
+ComfyUI's Load Image convention: `1` is transparent and `0` is opaque.
 
 **Other:** `sample_frames`, `dither` (`bayer2/4/8` — deterministic, does
 not flicker across frames, unlike Floyd–Steinberg), `output_scale_mode`
 (`manual` / `match_width` / `match_height` / `match_pixel_count`),
 `output_scale` (for `manual`), `seed`.
 
-**Outputs:** `image`, `palette_preview` (a swatch strip — feed back in
-as `custom_palette` after editing), `info` (a summary string: detected
-grid size/phase, cell count, palette source, resolved scale).
+**Outputs:** existing `image`, `palette_preview`, and `info`, followed by
+`transparent_image` (RGBA) and `transparency_mask`. Feed `palette_preview` back
+as `custom_palette` after editing; use RGBA only on the alpha-aware branch.
 
 ## Two nodes: core processing vs. live editor
 
@@ -350,7 +357,40 @@ the thumbnail count instead of the true total. Fixed by sending the
 true count separately; verified with a 300-frame / 30-thumbnail test
 where an edit at frame 250 (beyond the cap) correctly survived a re-run.
 
+For RGBA input, Retimer reorders alpha with exactly the same index sequence.
+The original `image` output remains RGB for compatibility with video encoders;
+use appended `transparent_image` for PNG/sprite export and
+`transparency_mask` when a separate Comfy MASK is needed.
 
+## Node: `Sprite Sheet`
+
+`VideoPixelSnapperSpriteSheet` is a focused, model-free row-major assembler.
+Connect Frame Retimer's `transparent_image`, choose `columns`, and optionally
+add transparent `padding`. Frames are copied bit-exactly into the sheet—there
+is no scaling, interpolation, palette conversion, or RGB/alpha blending.
+Unused cells in the final row and all padding remain transparent.
+
+Outputs are `sprite_sheet`, a summary string, and integer frame width, frame
+height, columns, and rows. Connect `sprite_sheet` to ComfyUI's standard
+`Save Image`; with RGBA input the file is a transparent PNG.
+
+Recommended transparent chain:
+
+```text
+Video Pixel Snapper.transparent_image
+  → Motion-Aware Cleanup.image
+Motion-Aware Cleanup.transparent_image
+  → Live Editor.snapped_image
+Live Editor.transparent_image
+  → Frame Retimer.image
+Frame Retimer.transparent_image
+  → Sprite Sheet.image
+Sprite Sheet.sprite_sheet
+  → Save Image
+```
+
+The parallel RGB outputs remain available for VHS/MP4 encoding, whose common
+formats do not preserve alpha.
 
 ## Companion: `palette_editor.html`
 
@@ -420,11 +460,16 @@ smearing/trailing it was intended to remove.
 New required wiring:
 
 ```text
-original/pre-snap video IMAGE ───────────────> Motion-Aware Cleanup.guide_image
-Video Pixel Snapper image (output_scale=1) ──> Motion-Aware Cleanup.image
-Video Pixel Snapper info ────────────────────> Motion-Aware Cleanup.snapper_info
-Motion-Aware Cleanup.image ──────────────────> Live Editor / Retimer / output
+original/pre-snap video IMAGE ─────────────────────> Motion-Aware Cleanup.guide_image
+Video Pixel Snapper transparent_image (scale=1) ──> Motion-Aware Cleanup.image
+Video Pixel Snapper info ─────────────────────────> Motion-Aware Cleanup.snapper_info
+Motion-Aware Cleanup.transparent_image ───────────> Live Editor / Retimer / PNG
 ```
+
+The old RGB `image` connection remains valid, but RGBA input lets Cleanup
+preserve alpha exactly and update it only for accepted silhouette changes.
+Cleanup appends `transparent_image` and `transparency_mask` after all existing
+diagnostics.
 
 Motion is estimated from `guide_image`, where texture and edges still exist.
 A 1920p guide and ~144p cell image are expected: flow vectors are resized to
@@ -467,6 +512,16 @@ labels do not repeat—such as `A→B→C→D` shade shimmer—the fallback choo
 observed aligned temporal medoid from a compact color cluster. The medoid is an
 existing snapped color, never an RGB mean.
 
+For stronger internal stability, `stability_lock` adds bounded trajectory
+hysteresis. A previous stabilized palette label is warped into the current
+frame with cycle-consistent motion and may be held for up to three frames while
+the aligned candidate colors remain a compact cluster around it. The accepted
+feature region is also propagated through valid motion, so a tiny eye or line
+that vanishes completely—and therefore has no current-frame boundary—can still
+be restored briefly. `maximum_lock` extends the window to 9 frames, region
+radius to 3 cells, and hold cap to 6 frames. Holds and propagated regions still
+expire; neither mode votes at fixed screen coordinates or creates new colors.
+
 Occlusion, disocclusion, scene cuts, out-of-bounds motion, and unreliable flow
 all fall back to the current snapped frame. Final RGB values are selected from
 existing snapped frames only—there is no averaging, bilinear RGB blend, or new
@@ -476,8 +531,8 @@ off-palette color.
 
 The normal `Motion-Aware Cleanup` exposes only five controls:
 
-- `cleanup_preset`: `balanced`, `strong`, `very_strong`, `outline_lock`, or
-  `detail_lock`;
+- `cleanup_preset`: `balanced`, `strong`, `very_strong`, `outline_lock`,
+  `detail_lock`, `stability_lock`, or `maximum_lock`;
 - `flow_quality`: `fast`, `balanced`, or `quality`;
 - `flow_backend`;
 - `compute_device`;
@@ -487,8 +542,12 @@ Use `outline_lock` for crawling spine teeth/outlines: it keeps interior color
 cleanup conservative while making external-edge consensus and temporal-medoid
 fallback most aggressive. Use `detail_lock` when the remaining ripple is on
 internal palette boundaries, thin lines, facial features, eyes, mouth, ears,
-or similar structure. Use `very_strong` for broad flicker not limited to
-recognized boundaries.
+or similar structure. Use `stability_lock` when those internal details still
+buzz after the other presets and suppressing brief micro-animation is an
+acceptable trade-off. Use `maximum_lock` only when `stability_lock` still
+buzzes: it uses a wider internal region, a 9-frame window, and up to six held
+frames, so it can suppress more genuine detail animation. Use `very_strong` for
+broad flicker not limited to recognized boundaries.
 
 All individual thresholds remain available in the separate
 `Motion-Aware Cleanup Advanced` node. This keeps ordinary workflows readable
@@ -528,14 +587,22 @@ Start with `cleanup_preset=strong`, `flow_quality=balanced`, and
 `edge_radius=2`. For crocodile-spine/outer-outline shimmer, switch to
 `cleanup_preset=outline_lock`. For beige/green body borders, muscles, folds,
 nose lines, eyes, mouth, ears, and other internal detail ripple, use
-`cleanup_preset=detail_lock`. If the detail's motion itself is mistracked, also
-switch `flow_quality=quality`.
+`cleanup_preset=detail_lock`. If that is still insufficient and stability is
+more important than brief detail motion, use `cleanup_preset=stability_lock`,
+then `maximum_lock` as the final aggressive step. If the detail's motion itself
+is mistracked, also switch `flow_quality=quality`; otherwise `balanced` is
+usually preferable.
 
 In the Advanced node the roughly equivalent balanced edge controls are
 `edge_agreement=0.6`, `edge_min_support=3`, `edge_max_color_distance=0.8`,
 `edge_medoid_fallback=true`, and `edge_cluster_radius=0.35`. Internal locking
 also requires `feature_edge_stabilization=true`; start with
-`feature_radius=1` and `feature_contrast_threshold=0.08`.
+`feature_radius=1` and `feature_contrast_threshold=0.08`. Bounded inertia is
+controlled by `feature_hysteresis`, `feature_hold_frames`, and
+`feature_hold_radius`; the `stability_lock` equivalents are `true`, `3`, and
+`0.75`, with radius 2 and contrast threshold 0.05. `maximum_lock` uses window
+9, radius 3, contrast threshold 0.04, hold 6, and hold radius 0.90. Advanced
+windows up to 11 are available, but longer is not automatically safer.
 
 Diagnostics:
 
@@ -551,20 +618,25 @@ Diagnostics:
   useful diagnostic for crawling spine teeth and outline holes.
 - `edge_color_changes` shows palette-index corrections in the retained
   foreground immediately beside the external background/silhouette.
-- `feature_color_changes` shows only corrections on internal palette borders
-  and thin drawn details. It is appended as output 8; outputs 1–7 retain their
-  previous order.
-- `info` reports `reliable_links`, `confidence_mean`, replacement counts
-  (including separate `edge_replaced` and `feature_replaced`), scene cuts, and
-  whether exact `grid_crop` or fallback `resize_only` alignment ran.
+- `feature_color_changes` shows actual output corrections on internal palette
+  borders and thin drawn details.
+- `feature_hysteresis_actions` shows where the previous motion-aligned stable
+  label overrode the independently selected current label (output 9).
+- `transparent_image` and `transparency_mask` are appended as outputs 10–11;
+  outputs 1–9 retain their previous order.
+- `info` reports `reliable_links`, `confidence_mean`, replacement counts,
+  hysteresis state and `feature_held`, scene cuts, and whether exact
+  `grid_crop` or fallback `resize_only` alignment ran.
 
 If pixels still flicker, first inspect confidence: low confidence means the
 node is deliberately refusing to invent correspondence. Increase RAFT quality
 before lowering agreement thresholds. On the simple node, choose by region:
-`strong` for general cleanup, `outline_lock` for the outside contour, and
-`detail_lock` for internal boundaries/lines; reserve `very_strong` for broad
-flicker. Use `flow_quality=quality` when confidence is low rather than merely
-increasing cleanup strength. In the Advanced node, all-unique edge shades are
+`strong` for general cleanup, `outline_lock` for the outside contour,
+`detail_lock` for internal boundaries/lines, `stability_lock` when internal
+medoid chatter remains, and `maximum_lock` only if that still buzzes; reserve
+`very_strong` for broad flicker. Use
+`flow_quality=quality` when confidence is low rather than merely increasing
+cleanup strength. In the Advanced node, all-unique edge shades are
 controlled mainly by `edge_medoid_fallback` and `edge_cluster_radius`; raise
 the radius from `0.35` to `0.5–0.7` only if those shades genuinely belong to
 one compact color family.
@@ -593,6 +665,17 @@ single-cell changes much better than side-by-side playback.
 
 ## Recent fixes
 
+- **Hard-alpha PNG now survives the complete graph.** Core, Cleanup, Live
+  Editor, and Retimer append RGBA/mask outputs while preserving their existing
+  RGB outputs for compatibility.
+- **A focused Sprite Sheet node was added.** It copies reordered RGBA frames
+  row-major without interpolation and keeps padding/unused cells transparent.
+- **`maximum_lock` covers disappearing internal details.** It propagates the
+  accepted feature region through valid motion and applies a wider, longer but
+  still bounded discrete-label hold.
+- **`stability_lock` suppresses internal medoid chatter.** Bounded,
+  motion-aligned label hysteresis holds a discrete observed color for at most
+  three frames while geometry and the local candidate cluster remain valid.
 - **RAFT peak memory is bounded more tightly.** Directions run sequentially,
   full-resolution flow is discarded per chunk after cell-grid resizing, and
   the `quality` preset uses a one-pair model batch.
@@ -603,7 +686,7 @@ single-cell changes much better than side-by-side playback.
   pass.** `detail_lock` targets belly/skin borders, muscles, folds, nose lines,
   eyes, mouth, ears, and similar foreground structure; `feature_color_changes`
   isolates its edits.
-- **The normal cleanup node still has only five controls.** Five tested cleanup
+- **The normal cleanup node still has only five controls.** Seven tested cleanup
   presets and three flow-quality presets cover ordinary tuning; the full
   parameter surface remains in `Motion-Aware Cleanup Advanced`.
 - **All-unique edge shades now use temporal palette medoid fallback.** This
@@ -684,12 +767,20 @@ more substantial features in one pass isn't a good way to keep that up):
 
 ## Known limitations
 
+- Transparent export is hard cell-level alpha intended for PNG and sprite
+  sheets. H.264/MP4 does not preserve it; use the parallel RGB output for VHS.
+- Not every third-party ComfyUI image node accepts four-channel IMAGE tensors.
+  Keep processing on RGB where needed and use appended `transparent_image`
+  outputs only through the documented alpha-aware branch.
 - Grid size/phase assume a single, uniform block size across X and Y.
 - Motion-Aware Cleanup is deliberately conservative: flow failure or
   disocclusion leaves the current frame unchanged, so some flicker can remain.
-  It cannot reconstruct a detail that the source video semantically changes or
-  hallucinates in every frame; keyframe propagation/manual cleanup is still the
-  production answer for those regions.
+  `stability_lock` deliberately trades up to three frames of internal
+  micro-animation for stronger stability, while `maximum_lock` trades up to six;
+  use `detail_lock` when that trade-off is undesirable. The node cannot
+  reconstruct a detail that the source video
+  semantically changes or hallucinates in every frame; keyframe
+  propagation/manual cleanup is still the production answer for those regions.
 - Integer block matching only models local cell translations. Use RAFT for
   deformation, rotation, and larger motion.
 - Mask output is intentionally cell-level and hard-edged. Tune

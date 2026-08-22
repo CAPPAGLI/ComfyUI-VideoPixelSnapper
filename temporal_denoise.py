@@ -164,6 +164,32 @@ def _background_key_from_info(snapper_info: str):
     return r * 65536 + g * 256 + b
 
 
+def _transparent_outputs(
+    rgb: torch.Tensor,
+    background_key: Optional[int],
+    input_alpha: Optional[torch.Tensor] = None,
+    silhouette_changes: Optional[torch.Tensor] = None,
+):
+    """Append hard alpha and return ComfyUI's inverse-alpha MASK convention."""
+    if input_alpha is not None:
+        alpha = input_alpha.to(device=rgb.device, dtype=rgb.dtype).clamp(0.0, 1.0)
+        alpha_mode = "preserved"
+        if background_key is not None and silhouette_changes is not None:
+            final_foreground = _pack_keys(rgb) != int(background_key)
+            alpha = torch.where(
+                silhouette_changes > 0.5, final_foreground.to(rgb.dtype), alpha
+            )
+            alpha_mode = "preserved+topology"
+    elif background_key is not None:
+        alpha = (_pack_keys(rgb) != int(background_key)).to(rgb.dtype)
+        alpha_mode = "from_bg_key"
+    else:
+        alpha = torch.ones(rgb.shape[:3], device=rgb.device, dtype=rgb.dtype)
+        alpha_mode = "opaque(no metadata)"
+    rgba = torch.cat([rgb, alpha.unsqueeze(-1)], dim=-1)
+    return rgba, 1.0 - alpha, alpha_mode
+
+
 def _flow_grid(flow: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Create grid_sample coordinates for target->source flow.
 
@@ -515,6 +541,9 @@ def motion_compensated_label_consensus(
     feature_edge_stabilization: bool = False,
     feature_radius: int = 1,
     feature_contrast_threshold: float = 0.08,
+    feature_hysteresis: bool = False,
+    feature_hold_frames: int = 2,
+    feature_hold_radius: float = 0.45,
 ):
     """Discrete label consensus with a separate silhouette/topology pass.
 
@@ -530,10 +559,16 @@ def motion_compensated_label_consensus(
     silhouette_changes = torch.zeros((n, h, w), device=frames.device)
     edge_color_changes = torch.zeros((n, h, w), device=frames.device)
     feature_color_changes = torch.zeros((n, h, w), device=frames.device)
+    feature_hysteresis_actions = torch.zeros((n, h, w), device=frames.device)
+    feature_hold_age = torch.zeros((n, h, w), device=frames.device)
+    feature_region_history = torch.zeros(
+        (n, h, w), device=frames.device, dtype=torch.bool
+    )
     replaced = 0
     silhouette_replaced = 0
     edge_replaced = 0
     feature_replaced = 0
+    feature_held = 0
 
     def select_consensus(colors, keys, valid, current_key, current_rgb):
         current_count = ((keys == current_key.unsqueeze(0)) & valid).sum(dim=0)
@@ -742,7 +777,7 @@ def motion_compensated_label_consensus(
             normal_replace &= ~color_lock_region
 
         effective_edge_replace = edge_replace | edge_medoid_replace
-        replace = normal_replace | effective_edge_replace | silhouette_replace
+        base_replace = normal_replace | effective_edge_replace | silhouette_replace
         replacement_rgb = torch.where(
             edge_replace.unsqueeze(-1), geom_rgb, best_rgb
         )
@@ -752,7 +787,80 @@ def motion_compensated_label_consensus(
         replacement_rgb = torch.where(
             silhouette_replace.unsqueeze(-1), geom_rgb, replacement_rgb
         )
-        output[t] = torch.where(replace.unsqueeze(-1), replacement_rgb, frames[t])
+        base_output = torch.where(
+            base_replace.unsqueeze(-1), replacement_rgb, frames[t]
+        )
+
+        # Optional recurrent inertia for the strongest internal-detail preset.
+        # It propagates the previous *stabilized* discrete label through the
+        # cycle-consistent backward flow, but only holds it briefly while the
+        # current aligned candidate cloud remains compact around that label.
+        # This prevents a sliding temporal medoid from choosing a different
+        # nearby palette shade on every frame without becoming a fixed-screen
+        # coordinate filter or creating a new RGB value.
+        hold_applied = torch.zeros_like(normal_replace)
+        hysteresis_region = feature_region
+        if feature_hysteresis and t > 0 and background_key is not None:
+            # A detail can vanish completely in the current snapped frame, in
+            # which case current-frame contrast alone has no boundary to mark.
+            # Carry the previous accepted feature region through valid motion
+            # so a missing eye/line can still receive a bounded hold.
+            propagated_region = _warp_mask(
+                feature_region_history[t - 1], backward[t - 1]
+            )
+            propagated_region &= backward_geometry_conf[t - 1]
+            hysteresis_region = (
+                (feature_region | propagated_region)
+                & (~current_is_bg)
+                & (~external_proximity_region)
+            )
+            anchor_rgb, anchor_bounds = _warp_hwc(
+                output[t - 1], backward[t - 1], "nearest"
+            )
+            warped_age, age_bounds = _warp_bchw(
+                feature_hold_age[t - 1].unsqueeze(0).unsqueeze(0),
+                backward[t - 1].unsqueeze(0),
+                "nearest",
+            )
+            warped_age = warped_age[0, 0]
+            anchor_key = _pack_keys(anchor_rgb)
+            base_key = _pack_keys(base_output)
+            anchor_is_bg = anchor_key == int(background_key)
+            anchor_jump = (
+                anchor_rgb - frames[t]
+            ).square().sum(dim=-1).sqrt()
+            anchor_spread = torch.zeros(
+                (h, w), device=frames.device, dtype=frames.dtype
+            )
+            for i in range(colors.shape[0]):
+                distance = (
+                    anchor_rgb - colors[i]
+                ).square().sum(dim=-1).sqrt()
+                anchor_spread += distance * geometry_valid[i].to(frames.dtype)
+            anchor_spread /= geom_valid_count.to(frames.dtype).clamp(min=1.0)
+            hold_applied = (
+                hysteresis_region
+                & backward_geometry_conf[t - 1]
+                & anchor_bounds
+                & age_bounds[0]
+                & (~anchor_is_bg)
+                & (anchor_key != base_key)
+                & (geom_valid_count >= max(2, int(edge_min_support)))
+                & (anchor_spread <= float(feature_hold_radius))
+                & (anchor_jump <= edge_max_color_distance)
+                & (warped_age < max(1, int(feature_hold_frames)))
+            )
+            output[t] = torch.where(
+                hold_applied.unsqueeze(-1), anchor_rgb, base_output
+            )
+            feature_hold_age[t] = torch.where(
+                hold_applied, warped_age + 1.0, torch.zeros_like(warped_age)
+            )
+        else:
+            output[t] = base_output
+        feature_region_history[t] = feature_region | (
+            hysteresis_region & hold_applied
+        )
 
         color_neighbors = (valid_count.float() - 1.0).clamp(min=0.0)
         color_neighbors /= max(1.0, float(colors.shape[0] - 1))
@@ -760,17 +868,27 @@ def motion_compensated_label_consensus(
         geom_neighbors /= max(1.0, float(colors.shape[0] - 1))
         color_debug = agreement * color_neighbors
         geom_debug = geom_agreement * geom_neighbors
-        geometry_candidate = silhouette_candidate | edge_candidate
+        geometry_candidate = silhouette_candidate | edge_candidate | hold_applied
         debug_conf[t] = torch.where(geometry_candidate, geom_debug, color_debug)
-        silhouette_changes[t] = silhouette_replace.float()
-        external_changes = effective_edge_replace & external_edge_region
-        internal_changes = effective_edge_replace & feature_region
+
+        actual_replace = _pack_keys(output[t]) != current_key
+        silhouette_actual = silhouette_replace & actual_replace
+        external_changes = (
+            effective_edge_replace & external_edge_region & actual_replace
+        )
+        internal_changes = actual_replace & (
+            (feature_region & effective_edge_replace)
+            | (hysteresis_region & hold_applied)
+        )
+        silhouette_changes[t] = silhouette_actual.float()
         edge_color_changes[t] = external_changes.float()
         feature_color_changes[t] = internal_changes.float()
-        replaced += int(replace.sum().item())
-        silhouette_replaced += int(silhouette_replace.sum().item())
+        feature_hysteresis_actions[t] = hold_applied.float()
+        replaced += int(actual_replace.sum().item())
+        silhouette_replaced += int(silhouette_actual.sum().item())
         edge_replaced += int(external_changes.sum().item())
         feature_replaced += int(internal_changes.sum().item())
+        feature_held += int(hold_applied.sum().item())
 
     return (
         output,
@@ -782,18 +900,22 @@ def motion_compensated_label_consensus(
         edge_replaced,
         feature_color_changes,
         feature_replaced,
+        feature_hysteresis_actions,
+        feature_held,
     )
 
 
 class VideoPixelSnapperTemporalCleanupAdvanced:
     CATEGORY = "Video Pixel Snapper"
     RETURN_TYPES = (
-        "IMAGE", "MASK", "STRING", "IMAGE", "MASK", "MASK", "MASK", "MASK"
+        "IMAGE", "MASK", "STRING", "IMAGE", "MASK", "MASK", "MASK", "MASK",
+        "MASK", "IMAGE", "MASK",
     )
     RETURN_NAMES = (
         "image", "motion_confidence", "info", "confidence_preview",
         "changed_cells", "silhouette_changes", "edge_color_changes",
-        "feature_color_changes",
+        "feature_color_changes", "feature_hysteresis_actions",
+        "transparent_image", "transparency_mask",
     )
     FUNCTION = "run"
 
@@ -821,8 +943,9 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
                                "gpu forces acceleration; cpu is a diagnostic fallback."
                 }),
                 "window": ("INT", {
-                    "default": 5, "min": 3, "max": 7, "step": 2,
-                    "tooltip": "Motion-aligned temporal support. 5 is a conservative default."
+                    "default": 5, "min": 3, "max": 11, "step": 2,
+                    "tooltip": "Motion-aligned temporal support. 5 is conservative; 9–11 "
+                               "are intended only for maximum-stability cleanup."
                 }),
                 "agreement_threshold": ("FLOAT", {
                     "default": 0.6, "min": 0.34, "max": 1.0, "step": 0.02,
@@ -950,6 +1073,21 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
                     "tooltip": "Minimum local RGB palette difference considered an internal "
                                "feature edge."
                 }),
+                "feature_hysteresis": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Briefly retain the previous motion-aligned stabilized label "
+                               "inside internal detail regions. This strongly suppresses "
+                               "frame-to-frame medoid chatter but may remove micro-animation."
+                }),
+                "feature_hold_frames": ("INT", {
+                    "default": 2, "min": 1, "max": 6,
+                    "tooltip": "Maximum consecutive frames an aligned internal label may be held."
+                }),
+                "feature_hold_radius": ("FLOAT", {
+                    "default": 0.45, "min": 0.0, "max": 1.75, "step": 0.05,
+                    "tooltip": "Maximum mean distance from the held observed color to the "
+                               "current aligned candidate cloud."
+                }),
             },
             "optional": {
                 "snapper_info": ("STRING", {
@@ -971,8 +1109,13 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
         scene_threshold, search_radius, patch_radius,
         match_cost_threshold, flow_scale, raft_updates, flow_batch_size,
         keep_flow_model_loaded, feature_edge_stabilization, feature_radius,
-        feature_contrast_threshold, snapper_info="",
+        feature_contrast_threshold, feature_hysteresis, feature_hold_frames,
+        feature_hold_radius, snapper_info="",
     ):
+        input_alpha = (
+            image[..., 3].float().clamp(0.0, 1.0)
+            if image.shape[-1] > 3 else None
+        )
         image = _drop_alpha(image)
         guide_image = _drop_alpha(guide_image)
         n, h, w, _ = image.shape
@@ -985,12 +1128,19 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
         aligned_guide, alignment_info = _align_guide_to_snapper(
             guide_image, snapper_info, h, w
         )
+        background_key = _background_key_from_info(snapper_info)
         if n <= 1:
             confidence = torch.zeros((n, h, w), device=output_device)
             changed = torch.zeros_like(confidence)
+            rgba, transparency, alpha_mode = _transparent_outputs(
+                image, background_key, input_alpha, changed
+            )
             return (
-                image, confidence, "1 frame: no temporal processing; " + alignment_info,
+                image, confidence,
+                "1 frame: no temporal processing; alpha=" + alpha_mode + "; "
+                + alignment_info,
                 _confidence_heatmap(confidence), changed, changed, changed, changed,
+                changed, rgba, transparency,
             )
 
         work_device = _resolve_compute_device(compute_device)
@@ -1011,12 +1161,12 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
             float(photometric_threshold), float(flow_consistency),
             float(match_cost_threshold), float(scene_threshold),
         )
-        background_key = _background_key_from_info(snapper_info)
         (
             out, confidence, replaced,
             silhouette_changes, silhouette_replaced,
             edge_color_changes, edge_replaced,
             feature_color_changes, feature_replaced,
+            feature_hysteresis_actions, feature_held,
         ) = motion_compensated_label_consensus(
             image, guide_low, forward, backward,
             f_conf, b_conf, f_geometry, b_geometry,
@@ -1028,9 +1178,14 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
             float(edge_max_color_distance), bool(edge_medoid_fallback),
             float(edge_cluster_radius), bool(feature_edge_stabilization),
             int(feature_radius), float(feature_contrast_threshold),
+            bool(feature_hysteresis), int(feature_hold_frames),
+            float(feature_hold_radius),
         )
         out = out.clamp(0.0, 1.0)
         changed = (_pack_keys(out) != _pack_keys(image)).float()
+        transparent_image, transparency_mask, alpha_mode = _transparent_outputs(
+            out, background_key, input_alpha, silhouette_changes
+        )
         preview = _confidence_heatmap(confidence)
         total = max(1, n * h * w)
         reliable = (f_conf.float().mean() + b_conf.float().mean()) * 0.5
@@ -1052,6 +1207,12 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
             feature_state = "off(no background metadata)"
         else:
             feature_state = "on"
+        if not bool(feature_hysteresis):
+            hysteresis_state = "off(user)"
+        elif feature_state != "on":
+            hysteresis_state = "off(feature pass unavailable)"
+        else:
+            hysteresis_state = f"on(max={int(feature_hold_frames)})"
         raft_memory_note = (
             f" flow_batch={int(flow_batch_size)} raft_pass=sequential"
             if flow_backend == "raft_small" else ""
@@ -1065,7 +1226,9 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
             f"silhouette={silhouette_state} silhouette_replaced={silhouette_replaced} "
             f"edge_colors={edge_state} edge_replaced={edge_replaced} "
             f"features={feature_state} feature_replaced={feature_replaced} "
-            f"scene_cuts={int(cuts.sum().item())}; {alignment_info}"
+            f"hysteresis={hysteresis_state} feature_held={feature_held} "
+            f"alpha={alpha_mode} scene_cuts={int(cuts.sum().item())}; "
+            f"{alignment_info}"
         )
         return (
             out.to(output_device),
@@ -1076,6 +1239,9 @@ class VideoPixelSnapperTemporalCleanupAdvanced:
             silhouette_changes.to(output_device),
             edge_color_changes.to(output_device),
             feature_color_changes.to(output_device),
+            feature_hysteresis_actions.to(output_device),
+            transparent_image.to(output_device),
+            transparency_mask.to(output_device),
         )
 
 
@@ -1099,11 +1265,12 @@ class VideoPixelSnapperTemporalCleanup:
                 }),
                 "cleanup_preset": ([
                     "balanced", "strong", "very_strong", "outline_lock",
-                    "detail_lock"
+                    "detail_lock", "stability_lock", "maximum_lock"
                 ], {
                     "default": "strong",
-                    "tooltip": "outline_lock targets the outside contour. detail_lock also "
-                               "stabilizes internal palette borders and thin drawn details."
+                    "tooltip": "outline_lock targets the outside contour; detail_lock targets "
+                               "internal structure; stability_lock adds short label inertia; "
+                               "maximum_lock uses wider regions and a longer bounded hold."
                 }),
                 "flow_quality": (["fast", "balanced", "quality"], {
                     "default": "balanced",
@@ -1164,6 +1331,18 @@ class VideoPixelSnapperTemporalCleanup:
                 edge_agree=0.40, edge_support=2, edge_max=1.30,
                 cluster=0.60, photo=0.14, cycle=1.50,
             ),
+            "stability_lock": dict(
+                window=7, agreement=0.55, data=0.020, max_color=0.45,
+                sil_agree=0.60, sil_support=2,
+                edge_agree=0.40, edge_support=2, edge_max=1.50,
+                cluster=0.75, photo=0.15, cycle=1.50,
+            ),
+            "maximum_lock": dict(
+                window=9, agreement=0.50, data=0.030, max_color=0.60,
+                sil_agree=0.55, sil_support=2,
+                edge_agree=0.34, edge_support=2, edge_max=1.65,
+                cluster=0.90, photo=0.16, cycle=1.75,
+            ),
         }
         flow_presets = {
             "fast": dict(scale=0.35, updates=6, batch=6, search=3),
@@ -1180,7 +1359,18 @@ class VideoPixelSnapperTemporalCleanup:
             p["edge_max"], True, p["cluster"],
             p["photo"], p["cycle"], 0.30,
             q["search"], 2, 0.05, q["scale"], q["updates"], q["batch"],
-            False, cleanup_preset == "detail_lock", 1, 0.08, snapper_info,
+            False,
+            cleanup_preset in ("detail_lock", "stability_lock", "maximum_lock"),
+            3 if cleanup_preset == "maximum_lock" else (
+                2 if cleanup_preset == "stability_lock" else 1
+            ),
+            0.04 if cleanup_preset == "maximum_lock" else (
+                0.05 if cleanup_preset == "stability_lock" else 0.08
+            ),
+            cleanup_preset in ("stability_lock", "maximum_lock"),
+            6 if cleanup_preset == "maximum_lock" else 3,
+            0.90 if cleanup_preset == "maximum_lock" else 0.75,
+            snapper_info,
         )
         # Prefix preset diagnostics without changing output ordering.
         values = list(result)

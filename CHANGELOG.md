@@ -1,5 +1,93 @@
 # Changelog
 
+## 2.0.0 — 2026-08-17
+
+### Hard-alpha PNG pipeline
+
+- Added `background_mode=solid/transparent` to Video Pixel Snapper. Transparent
+  mode requires the connected BiRefNet/RMBG foreground mask and creates hard
+  cell-level alpha with no semi-transparent fringe.
+- Transparent mode uses a deterministic internal 8-bit background key that is
+  absent from the foreground palette. The key remains available to Motion-Aware
+  Cleanup for topology consensus but is invisible in RGBA export.
+- Appended `transparent_image` (RGBA IMAGE) and `transparency_mask` to Video
+  Pixel Snapper. Existing RGB `image`, `palette_preview`, and `info` outputs keep
+  their names, types, and order.
+- Appended the same two export outputs to both Cleanup nodes. Input alpha is
+  preserved exactly; silhouette corrections update alpha only where topology
+  actually changed. Cleanup can also derive hard alpha from background metadata
+  when RGB input is used.
+- Live Editor now preserves incoming hard alpha and appends RGBA/mask outputs.
+- Frame Retimer no longer discards alpha. Its original RGB `image` and `info`
+  outputs remain first, with reordered RGBA/mask outputs appended.
+- `transparency_mask` follows ComfyUI/Load Image convention: 1 means transparent,
+  0 means opaque. All alpha is nearest-neighbor/hard; no matting or blending is
+  introduced.
+
+### Sprite Sheet node
+
+- Added a sixth focused node, `Sprite Sheet (Video Pixel Snapper)`, for row-major
+  assembly of an RGB/RGBA frame batch.
+- The node exposes only `columns` and `padding`, never resizes frames, preserves
+  RGBA values bit-exactly, and leaves unused cells and padding transparent.
+- Outputs include the sheet plus frame width/height and resolved columns/rows
+  metadata for game-engine import.
+
+### Validation
+
+- Added hard-alpha core, unique hidden-key, missing-mask error, Cleanup alpha,
+  RGBA Retimer, transparent sheet, and complete
+  Core→Cleanup→Live Editor→Retimer→Sprite Sheet integration regressions.
+- 39 automated tests pass. Existing v1.9.0 output prefixes and serialized input
+  controls remain compatible; only new outputs/controls are appended.
+
+## 1.9.0 — 2026-08-16
+
+### Maximum internal stability
+
+- Added the opt-in `maximum_lock` preset for cases where `stability_lock` still
+  leaves visible internal buzzing. It uses a 9-frame motion-aligned window,
+  three-cell internal-region dilation, a six-frame bounded hold, and wider but
+  still finite observed-color cluster gates.
+- Hysteresis now propagates the previously accepted internal feature region
+  through cycle-consistent motion. A one-cell eye, fold, or line that vanishes
+  completely has no boundary in the current snapped frame; the propagated
+  region lets the previous observed label restore it temporarily.
+- Propagated regions survive only where a hysteresis hold is actually accepted.
+  They are rejected by background/external-edge classification, invalid motion,
+  scene cuts, color spread, color jump, and the finite hold age.
+- Increased the Advanced temporal-window ceiling from 7 to 11 for deliberate
+  maximum-stability work. Existing presets and serialized controls are unchanged.
+- Added regressions for a fully missing internal dot restored from the prior
+  motion-aligned feature region and for `maximum_lock`'s wider/longer settings.
+  33 automated tests pass.
+
+## 1.8.0 — 2026-08-16
+
+### Bounded motion-aligned feature hysteresis
+
+- Added `stability_lock`, an opt-in maximum-stability preset for internal
+  palette regions, eyes, mouth, folds, muscle lines, and other small details.
+- Independent sliding-window medoids can choose a different nearby palette
+  shade on consecutive frames. The new pass motion-warps the previous
+  stabilized discrete label into the current frame and briefly prefers it
+  while the cycle-consistent candidate cloud remains compact.
+- Hysteresis is restricted to detected internal feature regions, requires
+  forward/backward-valid geometry, rejects background labels, observes the
+  existing color-distance gate, and expires after three held frames in the
+  preset. It is not a fixed-screen-coordinate filter.
+- Every held label is copied from a previously stabilized snapped frame. No RGB
+  averaging, interpolation, or synthesized palette colors are used.
+- Added Advanced controls: `feature_hysteresis`, `feature_hold_frames`, and
+  `feature_hold_radius`. They are appended after all v1.7.1 inputs.
+- Appended `feature_hysteresis_actions` as output 9; outputs 1–8 retain their
+  prior names, types, and order. `info` reports hysteresis state and
+  `feature_held` action count.
+- Added regressions showing five internal medoid transitions reduced to one,
+  bounded release after the hold cap, exact observed-color preservation,
+  scene-cut isolation, and `stability_lock` preset activation. 31 automated
+  tests pass.
+
 ## 1.7.1 — 2026-08-16
 
 ### RAFT memory optimization

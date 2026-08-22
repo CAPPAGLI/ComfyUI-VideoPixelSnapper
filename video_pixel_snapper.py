@@ -136,6 +136,33 @@ def _ensure_background_color(palette: torch.Tensor, color: torch.Tensor,
     return palette, palette.shape[0] - 1
 
 
+def _unique_transparent_background_color(palette: torch.Tensor) -> torch.Tensor:
+    """Choose an invisible 8-bit RGB key absent from the foreground palette.
+
+    Motion Cleanup still needs a discrete working label for background cells.
+    In transparent mode that label is hidden by alpha, so it should be chosen
+    for identity rather than appearance and must not collide with foreground.
+    """
+    if palette.numel():
+        q = (palette[:, :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+        used = set((q[:, 0] * 65536 + q[:, 1] * 256 + q[:, 2]).tolist())
+    else:
+        used = set()
+    preferred = [
+        0xFF00FF, 0x00FFFF, 0xFFFF00, 0xFF0000,
+        0x00FF00, 0x0000FF, 0x010101, 0xFEFEFE,
+    ]
+    key = next((value for value in preferred if value not in used), None)
+    if key is None:
+        # At most 256 palette entries are in use, so a short deterministic
+        # scan of the 24-bit space is guaranteed to find a free key quickly.
+        key = 0
+        while key in used:
+            key += 1
+    rgb = [(key >> 16) & 255, (key >> 8) & 255, key & 255]
+    return torch.tensor(rgb, device=palette.device, dtype=palette.dtype) / 255.0
+
+
 # folder_paths / PIL only exist inside a real ComfyUI process. Import
 # defensively so the node still works (just without the live-editor
 # preview data) if this file is ever loaded outside ComfyUI, e.g. for
@@ -585,7 +612,8 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
                   cell_method: str, dither: str, despeckle: bool,
                   out_h: int, out_w: int, foreground_mask: torch.Tensor = None,
                   mask_threshold: float = 0.5, mask_cell_threshold: float = 0.25,
-                  background_index: int = None) -> torch.Tensor:
+                  background_index: int = None,
+                  return_foreground_mask: bool = False) -> torch.Tensor:
     """Apply one fixed grid/palette, automatically chunking long clips.
 
     ``nearest_palette_index`` already chunks its distance matrix, but the
@@ -613,6 +641,7 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
         dither_tile = _bayer_tile(dither, ch, cw, images.device) * dither_strength(palette)
 
     outputs = []
+    foreground_outputs = []
     for start in range(0, b, frames_per_chunk):
         end = min(start + frames_per_chunk, b)
         cropped = images[start:end, y0:y0 + ch, x0:x0 + cw, :]
@@ -678,8 +707,22 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
             mapped.permute(0, 3, 1, 2), size=(out_h, out_w), mode="nearest"
         ).permute(0, 2, 3, 1)
         outputs.append(mapped)
+        if return_foreground_mask:
+            if foreground_cells is None:
+                opaque = torch.ones(
+                    (cb, oh, ow), device=images.device, dtype=images.dtype
+                )
+            else:
+                opaque = foreground_cells.to(images.dtype)
+            opaque = F.interpolate(
+                opaque.unsqueeze(1), size=(out_h, out_w), mode="nearest"
+            ).squeeze(1)
+            foreground_outputs.append(opaque)
 
-    return torch.cat(outputs, dim=0)
+    result = torch.cat(outputs, dim=0)
+    if return_foreground_mask:
+        return result, torch.cat(foreground_outputs, dim=0)
+    return result
 
 
 def resolve_output_size(oh: int, ow: int, orig_h: int, orig_w: int, mode: str, manual_scale: int):
@@ -700,8 +743,11 @@ def resolve_output_size(oh: int, ow: int, orig_h: int, orig_w: int, mode: str, m
 
 class VideoPixelSnapper:
     CATEGORY = "Video Pixel Snapper"
-    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
-    RETURN_NAMES = ("image", "palette_preview", "info")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "IMAGE", "MASK")
+    RETURN_NAMES = (
+        "image", "palette_preview", "info", "transparent_image",
+        "transparency_mask",
+    )
     FUNCTION = "run"
 
     @classmethod
@@ -751,6 +797,12 @@ class VideoPixelSnapper:
                 "invert_mask": ("BOOLEAN", {"default": False,
                                               "tooltip": "Enable when white means background in your mask. "
                                                           "BiRefNet/RMBG normally uses white as foreground."}),
+                "background_mode": (["solid", "transparent"], {
+                    "default": "solid",
+                    "tooltip": "solid preserves the existing RGB working background. transparent "
+                               "uses a unique invisible RGB key plus hard cell alpha; connect "
+                               "transparent_image to the alpha-aware pipeline. Requires foreground_mask."
+                }),
             },
             "optional": {
                 "custom_palette": ("IMAGE", {"tooltip": "Optional fixed palette, fed in as an image (e.g. a "
@@ -770,7 +822,8 @@ class VideoPixelSnapper:
     def run(self, image, pixel_size, grid_detection_mode, cell_method, k_colors, accent_slots,
             sample_frames, dither, despeckle, output_scale_mode, output_scale, seed,
             mask_threshold=0.5, mask_cell_threshold=0.25, invert_mask=False,
-            custom_palette=None, foreground_mask=None, background_image=None):
+            background_mode="solid", custom_palette=None, foreground_mask=None,
+            background_image=None):
         image = _drop_alpha(image)
         if custom_palette is not None:
             custom_palette = _drop_alpha(custom_palette)
@@ -784,6 +837,12 @@ class VideoPixelSnapper:
         if foreground_mask is not None:
             prepared_mask = _prepare_mask(
                 foreground_mask, b, h, w, device, invert=bool(invert_mask)
+            )
+        transparent_mode = background_mode == "transparent"
+        if transparent_mode and prepared_mask is None:
+            raise ValueError(
+                "background_mode='transparent' requires foreground_mask from "
+                "BiRefNet/RMBG so hard alpha can be defined"
             )
 
         n_samples = min(sample_frames, b)
@@ -827,16 +886,19 @@ class VideoPixelSnapper:
         # --- palette ---
         background_index = None
         background_rgb = None
-        if prepared_mask is not None:
+        if prepared_mask is not None and not transparent_mode:
             background_rgb = _background_color(
                 image, prepared_mask, sample_idx, mask_threshold, background_image
             )
 
         if custom_palette is not None:
             palette = palette_from_image(custom_palette.to(device), cap=256, seed=seed)
-            if background_rgb is not None:
+            if prepared_mask is not None:
+                if transparent_mode:
+                    background_rgb = _unique_transparent_background_color(palette)
                 palette, background_index = _ensure_background_color(palette, background_rgb)
-                palette_source = f"custom+masked-bg ({palette.shape[0]} colors)"
+                mode_note = "transparent" if transparent_mode else "masked-bg"
+                palette_source = f"custom+{mode_note} ({palette.shape[0]} colors)"
             else:
                 palette_source = f"custom ({palette.shape[0]} colors)"
         else:
@@ -875,9 +937,15 @@ class VideoPixelSnapper:
                 palette = image.new_empty((0, 3))
                 n_accent = 0
 
-            if background_rgb is not None:
+            if prepared_mask is not None:
+                if transparent_mode:
+                    background_rgb = _unique_transparent_background_color(palette)
                 palette, background_index = _ensure_background_color(palette, background_rgb)
-                palette_source = f"auto masked ({palette.shape[0]} colors, {n_accent} accent, 1 bg)"
+                mode_note = "transparent" if transparent_mode else "masked"
+                palette_source = (
+                    f"auto {mode_note} ({palette.shape[0]} colors, "
+                    f"{n_accent} accent, 1 bg key)"
+                )
             else:
                 palette_source = f"auto ({palette.shape[0]} colors, {n_accent} accent)"
 
@@ -887,25 +955,30 @@ class VideoPixelSnapper:
         out_h, out_w, resolved_scale = resolve_output_size(oh, ow, h, w, output_scale_mode, output_scale)
 
         # --- apply ---
-        out = process_batch(
+        out, foreground_alpha = process_batch(
             image, block, phase_y, phase_x, palette, cell_method, dither,
             despeckle, out_h, out_w, foreground_mask=prepared_mask,
             mask_threshold=mask_threshold, mask_cell_threshold=mask_cell_threshold,
-            background_index=background_index,
+            background_index=background_index, return_foreground_mask=True,
         )
+        transparent_image = torch.cat(
+            [out, foreground_alpha.unsqueeze(-1)], dim=-1
+        )
+        transparency_mask = 1.0 - foreground_alpha
         preview = make_palette_preview(palette)
         mask_info = ""
         if prepared_mask is not None:
             bg8 = (background_rgb.clamp(0.0, 1.0) * 255).round().long().tolist()
             mask_info = (
                 f" mask=on bg=#{bg8[0]:02x}{bg8[1]:02x}{bg8[2]:02x} "
-                f"mask_threshold={mask_threshold:g} cell_threshold={mask_cell_threshold:g}"
+                f"background_mode={background_mode} mask_threshold={mask_threshold:g} "
+                f"cell_threshold={mask_cell_threshold:g}"
             )
         info = (f"grid={block}px phase=({phase_x},{phase_y}) cells={ow}x{oh} "
                 f"source={w}x{h} palette={palette_source} "
                 f"scale={resolved_scale}x -> {out_w}x{out_h}{mask_info}")
 
-        return (out, preview, info)
+        return (out, preview, info, transparent_image, transparency_mask)
 
 
 class VideoPixelSnapperEditor:
@@ -923,8 +996,8 @@ class VideoPixelSnapperEditor:
     """
 
     CATEGORY = "Video Pixel Snapper"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK")
+    RETURN_NAMES = ("image", "transparent_image", "transparency_mask")
     FUNCTION = "run"
 
     @classmethod
@@ -951,9 +1024,29 @@ class VideoPixelSnapperEditor:
         }
 
     def run(self, original_image, snapped_image, palette_preview, max_preview_frames, info=""):
+        snapped_alpha = (
+            snapped_image[..., 3].float().clamp(0.0, 1.0)
+            if snapped_image.shape[-1] > 3 else None
+        )
         original_image = _drop_alpha(original_image)
         snapped_image = _drop_alpha(snapped_image)
         palette_preview = _drop_alpha(palette_preview)
+        if snapped_alpha is None:
+            bg_match = re.search(r"mask=on bg=#([0-9a-fA-F]{6})", info or "")
+            if bg_match:
+                bg_key = int(bg_match.group(1), 16)
+                q = (snapped_image.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+                keys = q[..., 0] * 65536 + q[..., 1] * 256 + q[..., 2]
+                snapped_alpha = (keys != bg_key).to(snapped_image.dtype)
+            else:
+                snapped_alpha = torch.ones(
+                    snapped_image.shape[:3], device=snapped_image.device,
+                    dtype=snapped_image.dtype,
+                )
+        transparent_image = torch.cat(
+            [snapped_image, snapped_alpha.unsqueeze(-1)], dim=-1
+        )
+        transparency_mask = 1.0 - snapped_alpha
 
         raw_refs = _save_preview_images(original_image, "VPS_raw", max_frames=max_preview_frames)
         frame_refs = _save_preview_images(snapped_image, "VPS_frame", max_frames=max_preview_frames)
@@ -988,7 +1081,10 @@ class VideoPixelSnapperEditor:
             bg_match = re.search(r"mask=on bg=(#[0-9a-fA-F]{6})", info)
             if bg_match:
                 ui_data["vps_background"] = [bg_match.group(1).lower()]
-        return {"ui": ui_data, "result": (snapped_image,)}
+        return {
+            "ui": ui_data,
+            "result": (snapped_image, transparent_image, transparency_mask),
+        }
 
 
 NODE_CLASS_MAPPINGS = {

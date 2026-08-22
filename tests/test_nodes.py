@@ -15,6 +15,7 @@ from video_pixel_snapper import (
     process_batch,
 )
 from frame_retimer import VideoPixelSnapperFrameRetimer
+from sprite_sheet import VideoPixelSnapperSpriteSheet
 from temporal_denoise import (
     VideoPixelSnapperTemporalCleanup,
     VideoPixelSnapperTemporalCleanupAdvanced,
@@ -58,7 +59,7 @@ class CoreNodeTests(unittest.TestCase):
         palette = torch.tensor(
             [[[[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]]]]
         )
-        out, preview, info = VideoPixelSnapper().run(
+        out, preview, info, transparent, transparency = VideoPixelSnapper().run(
             image,
             pixel_size=4.0,
             grid_detection_mode="average_across_frames",
@@ -75,6 +76,9 @@ class CoreNodeTests(unittest.TestCase):
         )
         self.assertEqual(out.shape[-1], 3)
         self.assertEqual(preview.shape[-1], 3)
+        self.assertEqual(transparent.shape[-1], 4)
+        self.assertEqual(float(transparency.sum()), 0.0)
+        self.assertTrue(torch.equal(transparent[..., :3], out))
         self.assertIn("palette=custom (3 colors)", info)
         self.assertIn("source=32x24", info)
 
@@ -89,6 +93,8 @@ class CoreNodeTests(unittest.TestCase):
         self.assertEqual(result["ui"]["vps_grid"], [4, 1, 2, 8, 6, 3])
         self.assertEqual(result["ui"]["vps_background"], ["#0011aa"])
         self.assertEqual(result["result"][0].shape[-1], 3)
+        self.assertEqual(result["result"][1].shape[-1], 4)
+        self.assertEqual(result["result"][2].shape, snapped.shape[:3])
 
     def test_mask_broadcast_resize_and_invert(self):
         mask = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
@@ -114,7 +120,7 @@ class CoreNodeTests(unittest.TestCase):
                 image[:, y:y + 2, x:x + 2] = red if ((x + y) // 2) % 2 else green
 
         background_image = blue.view(1, 1, 1, 3).expand(1, 16, 16, 3).clone()
-        out, preview, info = VideoPixelSnapper().run(
+        out, preview, info, transparent, transparency = VideoPixelSnapper().run(
             image,
             pixel_size=2.0,
             grid_detection_mode="average_across_frames",
@@ -140,8 +146,49 @@ class CoreNodeTests(unittest.TestCase):
         non_background = swatches[~torch.isclose(swatches, blue).all(dim=1)]
         self.assertTrue((non_background[:, 2] < 0.1).all())
         self.assertTrue(torch.equal(out[:, 0, 0], blue.expand(3, 3)))
+        self.assertEqual(transparent.shape[-1], 4)
+        self.assertTrue((transparent[:, 0, 0, 3] == 0).all())
+        self.assertTrue((transparent[:, 3, 3, 3] == 1).all())
+        self.assertTrue((transparency[:, 0, 0] == 1).all())
+        self.assertTrue((transparency[:, 3, 3] == 0).all())
         self.assertIn("1 bg", info)
         self.assertIn("mask=on", info)
+
+    def test_transparent_mode_uses_unique_hidden_key_and_hard_alpha(self):
+        blue = torch.tensor([0.0, 0.0, 1.0])
+        red = torch.tensor([1.0, 0.0, 0.0])
+        image = blue.view(1, 1, 1, 3).expand(2, 12, 12, 3).clone()
+        image[:, 3:9, 3:9] = red
+        mask = torch.zeros(2, 12, 12)
+        mask[:, 3:9, 3:9] = 1.0
+        custom = red.view(1, 1, 1, 3)
+        out, _preview, info, transparent, transparency = VideoPixelSnapper().run(
+            image, pixel_size=3.0, grid_detection_mode="average_across_frames",
+            cell_method="majority", k_colors=4, accent_slots=0,
+            sample_frames=2, dither="none", despeckle=False,
+            output_scale_mode="manual", output_scale=1, seed=1,
+            mask_threshold=0.5, mask_cell_threshold=0.25,
+            invert_mask=False, background_mode="transparent",
+            custom_palette=custom, foreground_mask=mask,
+        )
+        self.assertIn("background_mode=transparent", info)
+        self.assertFalse(torch.equal(out[0, 0, 0], red))
+        self.assertEqual(float(transparent[0, 0, 0, 3]), 0.0)
+        self.assertEqual(float(transparent[0, 2, 2, 3]), 1.0)
+        self.assertEqual(float(transparency[0, 0, 0]), 1.0)
+        self.assertEqual(float(transparency[0, 2, 2]), 0.0)
+
+    def test_transparent_mode_requires_mask(self):
+        image = torch.rand(2, 8, 8, 3)
+        with self.assertRaisesRegex(ValueError, "requires foreground_mask"):
+            VideoPixelSnapper().run(
+                image, pixel_size=2.0,
+                grid_detection_mode="average_across_frames",
+                cell_method="majority", k_colors=4, accent_slots=0,
+                sample_frames=2, dither="none", despeckle=False,
+                output_scale_mode="manual", output_scale=1, seed=1,
+                background_mode="transparent",
+            )
 
     def test_masked_majority_ignores_background_pixels_inside_foreground_cell(self):
         red = torch.tensor([1.0, 0.0, 0.0])
@@ -240,7 +287,9 @@ class TemporalCleanupTests(unittest.TestCase):
                   edge_min_support=3, edge_max_color_distance=0.8,
                   edge_medoid=True, edge_cluster_radius=0.35,
                   feature_edges=False, feature_radius=1,
-                  feature_contrast_threshold=0.08):
+                  feature_contrast_threshold=0.08,
+                  feature_hysteresis=False, feature_hold_frames=2,
+                  feature_hold_radius=0.45):
         if guide is None:
             guide = frames
         return VideoPixelSnapperTemporalCleanupAdvanced().run(
@@ -254,6 +303,7 @@ class TemporalCleanupTests(unittest.TestCase):
             search_radius, patch_radius, 0.15,
             0.5, 8, 4, False,
             feature_edges, feature_radius, feature_contrast_threshold,
+            feature_hysteresis, feature_hold_frames, feature_hold_radius,
             snapper_info,
         )
 
@@ -263,7 +313,8 @@ class TemporalCleanupTests(unittest.TestCase):
         guide = torch.zeros_like(frames)
         (
             out, confidence, info, preview, changed,
-            silhouette_changed, edge_changed, feature_changed,
+            silhouette_changed, edge_changed, feature_changed, hysteresis_actions,
+            transparent, transparency,
         ) = self.run_block(
             frames, guide, search_radius=0, patch_radius=0
         )
@@ -273,9 +324,24 @@ class TemporalCleanupTests(unittest.TestCase):
         self.assertEqual(changed.shape, frames.shape[:3])
         self.assertEqual(silhouette_changed.shape, frames.shape[:3])
         self.assertEqual(feature_changed.shape, frames.shape[:3])
+        self.assertEqual(hysteresis_actions.shape, frames.shape[:3])
+        self.assertEqual(transparent.shape[-1], 4)
+        self.assertEqual(float(transparency.sum()), 0.0)
         self.assertEqual(float(changed[2, 1, 1]), 1.0)
         self.assertIn("backend=integer_block_matching", info)
         self.assertIn("device=cpu", info)
+
+    def test_cleanup_preserves_input_hard_alpha_even_when_rgb_key_collides(self):
+        rgba = torch.zeros(3, 5, 5, 4)
+        rgba[:, 1:4, 1:4, 3] = 1.0
+        result = self.run_block(
+            rgba, rgba.clone(), search_radius=0, patch_radius=0,
+            snapper_info="mask=on bg=#000000",
+        )
+        self.assertEqual(result[0].shape[-1], 3)
+        self.assertTrue(torch.equal(result[9][..., 3], rgba[..., 3]))
+        self.assertTrue(torch.equal(result[10], 1.0 - rgba[..., 3]))
+        self.assertIn("alpha=preserved+topology", result[2])
 
     def test_one_frame_silhouette_tooth_is_removed_without_color_gate(self):
         black = torch.tensor([0.0, 0.0, 0.0])
@@ -289,8 +355,11 @@ class TemporalCleanupTests(unittest.TestCase):
             snapper_info="mask=on bg=#000000",
             max_color_distance=0.10,  # ordinary color gate cannot cross fg/bg
         )
-        out, _confidence, info, _preview, changed, silhouette, _edge, _feature = result
+        out, _confidence, info, _preview, changed, silhouette, _edge, _feature, _hold, rgba, transparency = result
         self.assertTrue(torch.equal(out[2, 1, 3], black))
+        self.assertEqual(float(rgba[2, 1, 3, 3]), 0.0)
+        self.assertEqual(float(transparency[2, 1, 3]), 1.0)
+        self.assertEqual(float(rgba[2, 2, 3, 3]), 1.0)
         self.assertEqual(float(silhouette[2, 1, 3]), 1.0)
         self.assertEqual(float(changed[2, 1, 3]), 1.0)
         self.assertIn("silhouette=on", info)
@@ -313,7 +382,7 @@ class TemporalCleanupTests(unittest.TestCase):
             edge_colors=True, edge_radius=2, edge_agreement=0.6,
             edge_min_support=3, edge_max_color_distance=1.75,
         )
-        out, _confidence, info, _preview, changed, _silhouette, edge, _feature = result
+        out, _confidence, info, _preview, changed, _silhouette, edge, _feature, _hold, _rgba, _transparency = result
         self.assertTrue(torch.equal(out[2, 2, 3], green))
         self.assertEqual(float(edge[2, 2, 3]), 1.0)
         self.assertEqual(float(changed[2, 2, 3]), 1.0)
@@ -336,7 +405,7 @@ class TemporalCleanupTests(unittest.TestCase):
             edge_min_support=3, edge_max_color_distance=1.0,
             edge_medoid=True, edge_cluster_radius=0.5,
         )
-        out, _confidence, _info, _preview, _changed, _silhouette, edge, _feature = result
+        out, _confidence, _info, _preview, _changed, _silhouette, edge, _feature, _hold, _rgba, _transparency = result
         expected = torch.tensor([0.4, 0.4, 0.4])
         self.assertTrue(torch.allclose(out[2, 2, 3], expected))
         self.assertEqual(float(edge[2, 2, 3]), 1.0)
@@ -367,7 +436,7 @@ class TemporalCleanupTests(unittest.TestCase):
             feature_edges=True, feature_radius=1,
             feature_contrast_threshold=0.08,
         )
-        out, _confidence, info, _preview, changed, _silhouette, edge, feature = result
+        out, _confidence, info, _preview, changed, _silhouette, edge, feature, _hold, _rgba, _transparency = result
         # The temporal medoid is copied from frame 3; no RGB mean is created.
         self.assertTrue(torch.equal(out[2, 6, 6], shades[3]))
         self.assertEqual(float(changed[2, 6, 6]), 1.0)
@@ -375,6 +444,103 @@ class TemporalCleanupTests(unittest.TestCase):
         self.assertEqual(float(edge[2, 6, 6]), 0.0)
         self.assertIn("features=on", info)
         self.assertIn("feature_replaced=", info)
+
+    def test_feature_hysteresis_reduces_medoid_chatter_and_expires(self):
+        black = torch.tensor([0.0, 0.0, 0.0])
+        green = torch.tensor([0.05, 0.65, 0.20])
+        beige = torch.tensor([0.80, 0.65, 0.35])
+        values = [0.35, 0.55, 0.80, 0.45, 0.70, 0.40, 0.75, 0.50, 0.65]
+        frames = black.view(1, 1, 1, 3).expand(9, 13, 15, 3).clone()
+        frames[:, 1:12, 1:14] = green
+        frames[:, 2:11, 7:14] = beige
+        for t, value in enumerate(values):
+            frames[t, 6, 6] = torch.tensor([0.05, value, 0.18])
+        kwargs = dict(
+            search_radius=0, patch_radius=0,
+            snapper_info="mask=on bg=#000000",
+            max_color_distance=0.10,
+            edge_colors=True, edge_radius=2, edge_agreement=0.9,
+            edge_min_support=2, edge_max_color_distance=1.5,
+            edge_medoid=True, edge_cluster_radius=0.8,
+            feature_edges=True, feature_radius=2,
+            feature_contrast_threshold=0.05,
+        )
+        base = self.run_block(frames, frames.clone(), **kwargs)
+        held = self.run_block(
+            frames, frames.clone(), feature_hysteresis=True,
+            feature_hold_frames=3, feature_hold_radius=0.8, **kwargs,
+        )
+        base_keys = (base[0][:, 6, 6] * 255).round().to(torch.int64)
+        held_keys = (held[0][:, 6, 6] * 255).round().to(torch.int64)
+        base_transitions = (base_keys[1:] != base_keys[:-1]).any(dim=-1).sum()
+        held_transitions = (held_keys[1:] != held_keys[:-1]).any(dim=-1).sum()
+        self.assertEqual(int(base_transitions), 5)
+        self.assertEqual(int(held_transitions), 1)
+        self.assertEqual(int(held[8][:, 6, 6].sum()), 4)
+        # The three-frame cap eventually releases the old label rather than
+        # freezing the detail forever.
+        self.assertFalse(torch.equal(held[0][6, 6, 6], held[0][7, 6, 6]))
+        input_colors = {tuple(v.tolist()) for v in frames.reshape(-1, 3)}
+        self.assertTrue(all(
+            tuple(v.tolist()) in input_colors for v in held[0].reshape(-1, 3)
+        ))
+        self.assertIn("hysteresis=on(max=3)", held[2])
+        self.assertIn("feature_held=4", held[2])
+
+    def test_propagated_feature_region_restores_fully_missing_dot(self):
+        black = torch.tensor([0.0, 0.0, 0.0])
+        green = torch.tensor([0.05, 0.65, 0.20])
+        dot = torch.tensor([0.15, 0.10, 0.05])
+        frames = black.view(1, 1, 1, 3).expand(5, 13, 15, 3).clone()
+        frames[:, 1:12, 1:14] = green
+        frames[:, 6, 7] = dot
+        frames[2, 6, 7] = green  # no current-frame boundary remains here
+        kwargs = dict(
+            search_radius=0, patch_radius=0,
+            snapper_info="mask=on bg=#000000",
+            data_tolerance=0.01, max_color_distance=1.0,
+            edge_colors=True, edge_radius=2,
+            edge_min_support=2, edge_max_color_distance=1.0,
+            edge_medoid=True, edge_cluster_radius=0.8,
+            feature_edges=True, feature_radius=0,
+            feature_contrast_threshold=0.05,
+        )
+        base = self.run_block(frames, frames.clone(), **kwargs)
+        held = self.run_block(
+            frames, frames.clone(), feature_hysteresis=True,
+            feature_hold_frames=3, feature_hold_radius=0.8, **kwargs,
+        )
+        self.assertTrue(torch.equal(base[0][2, 6, 7], green))
+        self.assertTrue(torch.equal(held[0][2, 6, 7], dot))
+        self.assertEqual(float(held[8][2, 6, 7]), 1.0)
+        self.assertEqual(float(held[7][2, 6, 7]), 1.0)
+
+    def test_feature_hysteresis_does_not_cross_scene_cut(self):
+        black = torch.tensor([0.0, 0.0, 0.0])
+        green = torch.tensor([0.05, 0.65, 0.20])
+        beige = torch.tensor([0.80, 0.65, 0.35])
+        values = [0.35, 0.55, 0.80, 0.45, 0.70, 0.40, 0.75, 0.50, 0.65]
+        frames = black.view(1, 1, 1, 3).expand(9, 13, 15, 3).clone()
+        frames[:, 1:12, 1:14] = green
+        frames[:, 2:11, 7:14] = beige
+        for t, value in enumerate(values):
+            frames[t, 6, 6] = torch.tensor([0.05, value, 0.18])
+        guide = torch.zeros_like(frames)
+        guide[4:] = 1.0  # cut between frames 3 and 4
+        held = self.run_block(
+            frames, guide, search_radius=0, patch_radius=0,
+            snapper_info="mask=on bg=#000000",
+            max_color_distance=0.10,
+            edge_colors=True, edge_radius=2, edge_agreement=0.9,
+            edge_min_support=2, edge_max_color_distance=1.5,
+            edge_medoid=True, edge_cluster_radius=0.8,
+            feature_edges=True, feature_radius=2,
+            feature_contrast_threshold=0.05,
+            feature_hysteresis=True, feature_hold_frames=3,
+            feature_hold_radius=0.8,
+        )
+        self.assertEqual(float(held[8][4].sum()), 0.0)
+        self.assertIn("scene_cuts=1", held[2])
 
     def test_feature_pass_requires_locked_background_metadata(self):
         green = torch.tensor([0.05, 0.65, 0.20])
@@ -387,7 +553,7 @@ class TemporalCleanupTests(unittest.TestCase):
             edge_colors=False, edge_max_color_distance=1.75,
             feature_edges=True,
         )
-        out, _confidence, info, _preview, _changed, _silhouette, _edge, feature = result
+        out, _confidence, info, _preview, _changed, _silhouette, _edge, feature, _hold, _rgba, _transparency = result
         self.assertTrue(torch.equal(out[2, 3, 3], pink))
         self.assertEqual(float(feature.sum()), 0.0)
         self.assertIn("features=off(no background metadata)", info)
@@ -409,7 +575,7 @@ class TemporalCleanupTests(unittest.TestCase):
             feature_edges=True, feature_radius=1,
             feature_contrast_threshold=0.08,
         )
-        out, _confidence, _info, _preview, changed, _silhouette, edge, feature = result
+        out, _confidence, _info, _preview, changed, _silhouette, edge, feature, _hold, _rgba, _transparency = result
         self.assertTrue(torch.equal(out[2, 6, 7], line))
         self.assertEqual(float(changed[2, 6, 7]), 1.0)
         self.assertEqual(float(feature[2, 6, 7]), 1.0)
@@ -422,7 +588,7 @@ class TemporalCleanupTests(unittest.TestCase):
             "integer_block_matching", "cpu", 2,
             "mask=on bg=#000000",
         )
-        self.assertEqual(len(result), 8)
+        self.assertEqual(len(result), 11)
         self.assertIn("preset=strong", result[2])
         self.assertIn("device=cpu", result[2])
 
@@ -435,6 +601,31 @@ class TemporalCleanupTests(unittest.TestCase):
         )
         self.assertIn("preset=detail_lock", result[2])
         self.assertIn("features=on", result[2])
+        self.assertIn("hysteresis=off(user)", result[2])
+
+    def test_stability_lock_preset_enables_bounded_hysteresis(self):
+        frames = torch.zeros(3, 5, 5, 3)
+        result = VideoPixelSnapperTemporalCleanup().run(
+            frames, frames.clone(), "stability_lock", "fast",
+            "integer_block_matching", "cpu", 2,
+            "mask=on bg=#000000",
+        )
+        self.assertEqual(len(result), 11)
+        self.assertIn("preset=stability_lock", result[2])
+        self.assertIn("features=on", result[2])
+        self.assertIn("hysteresis=on(max=3)", result[2])
+
+    def test_maximum_lock_uses_wider_longer_stability_settings(self):
+        frames = torch.zeros(3, 5, 5, 3)
+        result = VideoPixelSnapperTemporalCleanup().run(
+            frames, frames.clone(), "maximum_lock", "fast",
+            "integer_block_matching", "cpu", 2,
+            "mask=on bg=#000000",
+        )
+        self.assertEqual(len(result), 11)
+        self.assertIn("preset=maximum_lock", result[2])
+        self.assertIn("window=9", result[2])
+        self.assertIn("hysteresis=on(max=6)", result[2])
 
     def test_tied_motion_aligned_vote_keeps_current(self):
         a = torch.tensor([0.0, 0.0, 0.0])
@@ -492,18 +683,99 @@ class TemporalCleanupTests(unittest.TestCase):
         self.assertTrue(torch.equal(out, frames))
 
 
+class TransparentPipelineTests(unittest.TestCase):
+    def test_hard_alpha_survives_cleanup_editor_retimer_and_sheet(self):
+        blue = torch.tensor([0.0, 0.0, 1.0])
+        red = torch.tensor([1.0, 0.0, 0.0])
+        raw = blue.view(1, 1, 1, 3).expand(3, 8, 8, 3).clone()
+        raw[:, 2:6, 2:6] = red
+        mask = torch.zeros(3, 8, 8)
+        mask[:, 2:6, 2:6] = 1.0
+        rgb, palette, info, transparent, _mask = VideoPixelSnapper().run(
+            raw, pixel_size=2.0,
+            grid_detection_mode="average_across_frames",
+            cell_method="majority", k_colors=4, accent_slots=0,
+            sample_frames=3, dither="none", despeckle=False,
+            output_scale_mode="manual", output_scale=1, seed=2,
+            mask_threshold=0.5, mask_cell_threshold=0.25,
+            invert_mask=False, background_mode="transparent",
+            foreground_mask=mask,
+        )
+        cleanup = VideoPixelSnapperTemporalCleanup().run(
+            transparent, raw, "maximum_lock", "fast",
+            "integer_block_matching", "cpu", 2, info,
+        )
+        self.assertTrue(torch.equal(cleanup[9][..., 3], transparent[..., 3]))
+        editor = VideoPixelSnapperEditor().run(
+            raw, cleanup[9], palette, 3, info
+        )["result"]
+        self.assertTrue(torch.equal(editor[1][..., 3], transparent[..., 3]))
+        _rgb_retimed, _retime_info, rgba_retimed, _retime_mask = (
+            VideoPixelSnapperFrameRetimer().run(
+                editor[1], json.dumps([2, 0, 2]), 0.0, 3
+            )
+        )
+        sheet = VideoPixelSnapperSpriteSheet().run(
+            rgba_retimed, columns=2, padding=0
+        )[0]
+        self.assertEqual(sheet.shape[-1], 4)
+        self.assertTrue(torch.equal(
+            sheet[0, 0:4, 0:4, 3], transparent[2, ..., 3]
+        ))
+        self.assertEqual(float(sheet[0, 4:8, 4:8, 3].sum()), 0.0)
+
+
+class SpriteSheetTests(unittest.TestCase):
+    def test_rgba_sheet_is_row_major_exact_and_empty_slots_are_transparent(self):
+        frames = torch.zeros(5, 2, 3, 4)
+        for i in range(5):
+            frames[i, ..., 0] = i / 4.0
+            frames[i, ..., 3] = 1.0
+        sheet, info, frame_w, frame_h, columns, rows = (
+            VideoPixelSnapperSpriteSheet().run(frames, columns=3, padding=1)
+        )
+        self.assertEqual(sheet.shape, (1, 5, 11, 4))
+        self.assertEqual((frame_w, frame_h, columns, rows), (3, 2, 3, 2))
+        self.assertTrue(torch.equal(sheet[0, 0:2, 0:3], frames[0]))
+        self.assertTrue(torch.equal(sheet[0, 0:2, 4:7], frames[1]))
+        self.assertTrue(torch.equal(sheet[0, 3:5, 4:7], frames[4]))
+        self.assertEqual(float(sheet[0, 3:5, 8:11, 3].sum()), 0.0)
+        self.assertEqual(float(sheet[0, :, 3, 3].sum()), 0.0)  # padding column
+        self.assertIn("layout=3x2", info)
+        self.assertIn("RGBA hard alpha preserved", info)
+
+
 class FrameRetimerTests(unittest.TestCase):
     def test_sequence_reorders_and_repeats_without_blending(self):
         image = torch.arange(4.0).view(4, 1, 1, 1).expand(-1, 1, 1, 3)
-        out, info = VideoPixelSnapperFrameRetimer().run(
+        out, info, transparent, transparency = VideoPixelSnapperFrameRetimer().run(
             image, json.dumps([2, 0, 2, 3]), 10.0, 4
         )
         self.assertEqual(out[:, 0, 0, 0].tolist(), [2.0, 0.0, 2.0, 3.0])
+        self.assertEqual(transparent.shape[-1], 4)
+        self.assertEqual(float(transparency.sum()), 0.0)
         self.assertIn("4 input frame(s) -> 4 output frame(s)", info)
+
+    def test_rgba_retiming_preserves_alpha_without_blending(self):
+        rgba = torch.zeros(3, 2, 2, 4)
+        rgba[0, ..., :3] = 0.2
+        rgba[1, ..., :3] = 0.5
+        rgba[2, ..., :3] = 0.8
+        rgba[0, 0, 0, 3] = 1.0
+        rgba[1, 0, 1, 3] = 1.0
+        rgba[2, 1, 1, 3] = 1.0
+        rgb, _info, transparent, mask = VideoPixelSnapperFrameRetimer().run(
+            rgba, json.dumps([2, 0, 2]), 0.0, 3
+        )
+        self.assertTrue(torch.equal(rgb, rgba[[2, 0, 2], ..., :3]))
+        self.assertTrue(torch.equal(transparent, rgba[[2, 0, 2]]))
+        self.assertTrue(torch.equal(mask, 1.0 - rgba[[2, 0, 2], ..., 3]))
 
     def test_non_array_json_falls_back_to_identity(self):
         image = torch.rand(3, 2, 2, 3)
-        out, _ = VideoPixelSnapperFrameRetimer().run(image, '{"0": 2}', 0.0, 3)
+        out, _, _transparent, _mask = VideoPixelSnapperFrameRetimer().run(
+            image, '{"0": 2}', 0.0, 3
+        )
         self.assertTrue(torch.equal(out, image))
 
 
