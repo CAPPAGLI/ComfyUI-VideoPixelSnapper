@@ -81,14 +81,17 @@ class VideoPixelSnapperFrameRetimer:
         }
 
     def run(self, image, sequence_json, source_fps, max_preview_frames):
+        rgba_input = image[..., :4] if image.shape[-1] > 3 else None
         alpha = (
-            image[..., 3].float().clamp(0.0, 1.0)
-            if image.shape[-1] > 3 else torch.ones(
+            rgba_input[..., 3] if rgba_input is not None else torch.ones(
                 image.shape[:3], device=image.device, dtype=image.dtype
             )
         )
         image = _drop_alpha(image)
-        transparent_input = torch.cat([image, alpha.unsqueeze(-1)], dim=-1)
+        transparent_input = (
+            rgba_input if rgba_input is not None
+            else torch.cat([image, alpha.unsqueeze(-1)], dim=-1)
+        )
         n = image.shape[0]
         try:
             parsed = json.loads(sequence_json) if sequence_json else []

@@ -1,9 +1,9 @@
 /**
- * Video Pixel Snapper — live palette editor widget.
+ * Video Pixel Snapper - live palette editor widget.
  *
  * Adds a DOM widget under the node showing the raw input frame, the
  * node's own output, and a live re-color preview that updates as you
- * edit the palette client-side — no need to re-run the graph to see
+ * edit the palette client-side - no need to re-run the graph to see
  * palette changes.
  *
  * Diagnostics go to the browser console only (search for
@@ -48,6 +48,27 @@ function fitRect(srcW, srcH, boxW, boxH) {
   const scale = Math.min(boxW / srcW, boxH / srcH);
   return { scale, w: srcW * scale, h: srcH * scale };
 }
+function rgbToOklab(rgb) {
+  const linear = rgb.map((value) => {
+    const x = Math.max(0, Math.min(255, value)) / 255;
+    return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+  });
+  const [r, g, b] = linear;
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [
+    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+  ];
+}
+function colorVector(rgb, mode) {
+  return mode === "oklab" ? rgbToOklab(rgb) : rgb;
+}
+function colorDistanceSquared(a, b) {
+  return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+}
 
 // Exact nearest-color search is O(pixels * colors). Fine for typical
 // snapped-resolution images, but "large video + many colors" (reported
@@ -56,27 +77,28 @@ function fitRect(srcW, srcH, boxW, boxH) {
 // 5 bits (32 levels), precompute the nearest palette index per bin once
 // (O(bins * colors), a one-time cost per palette change), then every
 // pixel is an O(1) table lookup. Benchmarked: ~7x faster at 800x1000px /
-// 96 colors, at the cost of ~10-15% of pixels picking an adjacent
-// (still close, per direct measurement — worst case ~20/441 units off)
-// color instead of the exact nearest one. Below the threshold this
+// 96 colors, at the cost of some bins picking an adjacent but still close
+// color instead of the exact nearest one. The LUT uses the same RGB/Oklab
+// metric reported by the Python core. Below the threshold this
 // isn't used at all, so typical-size images stay pixel-exact.
 const LUT_BITS = 5;
 const LUT_SHIFT = 8 - LUT_BITS;
 const LUT_SIZE = 1 << LUT_BITS;
 const LUT_THRESHOLD = 15_000_000; // pixels * colors
 
-function buildPaletteLUT(paletteRGB) {
+function buildPaletteLUT(paletteRGB, colorDistanceMode) {
   const lut = new Int32Array(LUT_SIZE * LUT_SIZE * LUT_SIZE);
+  const paletteSpace = paletteRGB.map((rgb) => colorVector(rgb, colorDistanceMode));
   for (let ri = 0; ri < LUT_SIZE; ri++) {
     const r = ri << LUT_SHIFT;
     for (let gi = 0; gi < LUT_SIZE; gi++) {
       const g = gi << LUT_SHIFT;
       for (let bi = 0; bi < LUT_SIZE; bi++) {
         const b = bi << LUT_SHIFT;
+        const value = colorVector([r, g, b], colorDistanceMode);
         let best = 0, bestD = Infinity;
-        for (let p = 0; p < paletteRGB.length; p++) {
-          const [pr, pg, pb] = paletteRGB[p];
-          const d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
+        for (let p = 0; p < paletteSpace.length; p++) {
+          const d = colorDistanceSquared(value, paletteSpace[p]);
           if (d < bestD) { bestD = d; best = p; }
         }
         lut[(ri << (2 * LUT_BITS)) | (gi << LUT_BITS) | bi] = best;
@@ -86,22 +108,22 @@ function buildPaletteLUT(paletteRGB) {
   return lut;
 }
 
-// Reduces a full-resolution RAW canvas down to (targetW x targetH) — one
+// Reduces a full-resolution RAW canvas down to (targetW x targetH) - one
 // color per output cell, taken as the per-channel MEDIAN of the raw
 // pixels that fall in that cell. Palette-independent (only depends on
 // the raw image + grid), so it's cached once per frame and reused
-// across any number of palette edits — see computeLiveCanvas for why
+// across any number of palette edits - see computeLiveCanvas for why
 // this replaced re-classifying the already-quantized snapped cache.
 //
 // `grid`, if given (from Video Pixel Snapper's `info` output, wired
 // into this node's optional `info` input), is {block, phaseX, phaseY}
-// — the REAL detected grid, so cell boundaries line up exactly with
+// - the REAL detected grid, so cell boundaries line up exactly with
 // what the core node actually used. Without it, falls back to a naive
 // centered block mapping, which can be a cell or two off from the true
 // alignment. Either way this is still a MEDIAN reduction, not the core
 // node's actual majority-vote-with-confidence-margin algorithm, so an
 // exact pixel-for-pixel match with "Snapped" isn't guaranteed even
-// with the right grid — the real, authoritative result always comes
+// with the right grid - the real, authoritative result always comes
 // from re-running the graph. This is a fast, close approximation for
 // live editing feedback, not a reimplementation of the whole pipeline.
 function blockMedianReduce(srcCanvas, targetW, targetH, grid) {
@@ -115,10 +137,19 @@ function blockMedianReduce(srcCanvas, targetW, targetH, grid) {
     for (let y = y0; y < y1; y++) {
       for (let x = x0; x < x1; x++) {
         const i = (y * srcW + x) * 4;
+        // Hidden RGB under alpha=0 is not image content. Photoshop masks and
+        // erasing often leave different white/magenta RGB payloads there;
+        // excluding non-visible samples prevents those editing methods from
+        // producing different Live palette assignments.
+        if (src[i + 3] < 128) continue;
         rs.push(src[i]); gs.push(src[i + 1]); bs.push(src[i + 2]);
       }
     }
-    if (!rs.length) return;
+    if (!rs.length) {
+      out.data[oi] = 0; out.data[oi + 1] = 0;
+      out.data[oi + 2] = 0; out.data[oi + 3] = 0;
+      return;
+    }
     rs.sort((a, b) => a - b); gs.sort((a, b) => a - b); bs.sort((a, b) => a - b);
     // torch.median uses the lower middle element for an even sample count.
     const mid = (rs.length - 1) >> 1;
@@ -155,12 +186,35 @@ function blockMedianReduce(srcCanvas, targetW, targetH, grid) {
   return out;
 }
 
+// Sample the center of each destination cell without browser interpolation.
+// Used for already-pixelized Snapped/mask data, where median reduction is both
+// unnecessary and could blur a hard changed-outline selector.
+function nearestCanvasReduce(srcCanvas, targetW, targetH) {
+  const srcW = srcCanvas.width, srcH = srcCanvas.height;
+  const src = srcCanvas.getContext("2d", { willReadFrequently: true })
+    .getImageData(0, 0, srcW, srcH).data;
+  const out = new ImageData(targetW, targetH);
+  for (let y = 0; y < targetH; y++) {
+    const sy = Math.min(srcH - 1, Math.floor((y + 0.5) * srcH / targetH));
+    for (let x = 0; x < targetW; x++) {
+      const sx = Math.min(srcW - 1, Math.floor((x + 0.5) * srcW / targetW));
+      const si = (sy * srcW + sx) * 4;
+      const oi = (y * targetW + x) * 4;
+      out.data[oi] = src[si];
+      out.data[oi + 1] = src[si + 1];
+      out.data[oi + 2] = src[si + 2];
+      out.data[oi + 3] = src[si + 3];
+    }
+  }
+  return out;
+}
+
 app.registerExtension({
   name: "VideoPixelSnapper.LiveEditor",
 
   async beforeRegisterNodeDef(nodeType, nodeData, appRef) {
     if (nodeType.comfyClass !== "VideoPixelSnapperEditor" && nodeData?.name !== "VideoPixelSnapperEditor") return;
-    log("node def matched — extension is active");
+    log("node def matched - extension is active");
 
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
@@ -169,6 +223,14 @@ app.registerExtension({
       log(`node instance created (id ${node.id})`);
 
       const uid = node.id;
+      // Browser-written exact Live PNG payload. Keep it serialized with the
+      // workflow but out of the ordinary node body; it is not human-editable.
+      const hideCommitWidget = () => {
+        const widget = node.widgets?.find((w) => w.name === "committed_live_png");
+        if (widget) { widget.computeSize = () => [0, -4]; widget.draw = () => {}; }
+      };
+      hideCommitWidget();
+
       const wrap = document.createElement("div");
       wrap.style.cssText =
         "display:flex;flex-direction:column;gap:6px;padding:8px;background:#1b1e24;" +
@@ -179,14 +241,14 @@ app.registerExtension({
             Live palette editor
           </div>
           <div style="display:flex;gap:2px;">
-            <button class="vps-h-minus" title="Shrink preview" style="font-size:10px;padding:2px 6px;">−</button>
+            <button class="vps-h-minus" title="Shrink preview" style="font-size:10px;padding:2px 6px;">-</button>
             <button class="vps-h-plus" title="Grow preview" style="font-size:10px;padding:2px 6px;">+</button>
           </div>
         </div>
 
         <div style="display:flex;align-items:center;justify-content:center;gap:8px;flex-shrink:0;">
           <button class="vps-prev" title="Previous frame" style="font-size:11px;padding:3px 8px;">&larr;</button>
-          <span class="vps-framecount" style="font-size:10px;color:#8b909c;min-width:56px;text-align:center;">—</span>
+          <span class="vps-framecount" style="font-size:10px;color:#8b909c;min-width:56px;text-align:center;">-</span>
           <button class="vps-next" title="Next frame" style="font-size:11px;padding:3px 8px;">&rarr;</button>
         </div>
 
@@ -198,7 +260,7 @@ app.registerExtension({
                            image-rendering:pixelated;touch-action:none;"></canvas>
           </div>
           <div style="flex:1;min-width:0;">
-            <div style="font-size:8px;color:#8b909c;text-align:center;">Snapped (auto palette)</div>
+            <div style="font-size:8px;color:#8b909c;text-align:center;">Snapped / processed</div>
             <canvas data-src="snapped" style="width:100%;height:84px;display:block;background:#111;border-radius:3px;
                            image-rendering:pixelated;touch-action:none;"></canvas>
           </div>
@@ -247,7 +309,7 @@ app.registerExtension({
                   style="flex:1;font-size:10px;padding:4px;">Replace selected</button>
         </div>
         <div style="display:flex;gap:4px;flex-shrink:0;">
-          <button class="vps-apply-saved-subst" title="Re-applies remembered from-color -> to-color substitutions to whichever palette entries are currently closest to each remembered 'from' — safer than reusing a whole saved palette verbatim on a different image/scene"
+          <button class="vps-apply-saved-subst" title="Re-applies remembered from-color -> to-color substitutions to whichever palette entries are currently closest to each remembered 'from' - safer than reusing a whole saved palette verbatim on a different image/scene"
                   style="flex:2;font-size:10px;padding:4px;">Apply saved substitutions</button>
           <button class="vps-clear-saved-subst" title="Forgets all remembered substitutions (stored in this browser only)"
                   style="flex:1;font-size:10px;padding:4px;">Forget</button>
@@ -258,7 +320,13 @@ app.registerExtension({
         <div class="vps-palette-empty" style="font-size:9px;color:#8b909c;">Palette is empty.</div>
 
         <div style="display:flex;gap:4px;flex-shrink:0;">
-          <button class="vps-reset" style="flex:1;font-size:10px;padding:4px;">Reset</button>
+          <button class="vps-commit-live" title="Serialize the exact visible Live canvas into this node. Queue once afterward to materialize it on the IMAGE/RGBA outputs. Single-image input only."
+                  style="flex:2;font-size:10px;padding:4px;background:#5f8f7d;">Commit Live -> output</button>
+          <button class="vps-clear-commit" title="Return node outputs to authoritative Snapped pass-through"
+                  style="flex:1;font-size:10px;padding:4px;">Clear commit</button>
+        </div>
+        <div style="display:flex;gap:4px;flex-shrink:0;">
+          <button class="vps-reset" style="flex:1;font-size:10px;padding:4px;">Reset palette</button>
         </div>
         <div style="display:flex;gap:4px;flex-shrink:0;">
           <input type="text" class="vps-subfolder" placeholder="subfolder" value="vps_palettes"
@@ -277,18 +345,21 @@ app.registerExtension({
       node.addDOMWidget(`vps_live_editor_${uid}`, "vps_live_editor", wrap, {});
 
       node._vps = {
-        rawRefs: [], frameRefs: [],
-        frameIdx: 0,
-        rawCache: {}, snappedCache: {},   // frameIdx -> {canvas,w,h}, loaded lazily
-        rawReducedCache: {},              // frameIdx -> ImageData: raw pixels block-reduced to cell
-                                           // resolution, palette-INDEPENDENT (see computeLiveCanvas)
+        rawRefs: [], frameRefs: [], postprocessMaskRefs: [],
+        frameIdx: 0, totalFrames: 0,
+        rawCache: {}, snappedCache: {}, postprocessMaskCache: {}, // loaded lazily
+        rawReducedCache: {}, snappedReducedCache: {}, postprocessMaskReducedCache: {},
+                                           // frameIdx -> ImageData reduced to cell resolution
         grid: null,                       // {block,phaseX,phaseY,cellsW,cellsH,scale}
                                            // from the optional core `info` connection
         backgroundHex: null,              // locked mask background, when reported by core
+        postprocessActive: false,          // changed-outline mask supplied by Sel-Out
+        colorDistance: "oklab",           // match Python core; carried in core info
         originalPalette: [],
         livePalette: [],
         paletteDirty: false,              // preserve edits on re-run, but refresh untouched palettes
         liveCache: { key: null, data: null },  // memoized live-recolor result
+        commitActive: false,              // exact Live PNG currently drives backend outputs
         tool: null,                       // 'pick' | 'delete' | 'replace' | 'measure' | null
         replaceSource: null,              // index into livePalette pending replacement
         measurePoints: [],                // up to 2 {sx, sy} points in RAW source-pixel space
@@ -298,6 +369,19 @@ app.registerExtension({
 
       const boxHeight = { px: 84 };
       const canvases = Array.from(wrap.querySelectorAll(".vps-previews canvas"));
+      // A checkerboard makes real alpha visually unambiguous. The old solid
+      // canvas background made hidden RGB under alpha=0 look like an ordinary
+      // restored backdrop whenever preview PNG alpha was accidentally lost.
+      canvases.forEach((canvas) => {
+        canvas.style.backgroundColor = "#15171c";
+        canvas.style.backgroundImage =
+          "linear-gradient(45deg,#252832 25%,transparent 25%)," +
+          "linear-gradient(-45deg,#252832 25%,transparent 25%)," +
+          "linear-gradient(45deg,transparent 75%,#252832 75%)," +
+          "linear-gradient(-45deg,transparent 75%,#252832 75%)";
+        canvas.style.backgroundSize = "12px 12px";
+        canvas.style.backgroundPosition = "0 0,0 6px,6px -6px,-6px 0";
+      });
       const boxOf = (key) => wrap.querySelector(`canvas[data-src="${key}"]`);
       const paletteRow = wrap.querySelector(".vps-palette");
       const paletteEmpty = wrap.querySelector(".vps-palette-empty");
@@ -312,10 +396,20 @@ app.registerExtension({
       const measureInfo = wrap.querySelector(".vps-measure-info");
       const measureTargetInput = wrap.querySelector(".vps-measure-target");
       const measureApplyBtn = wrap.querySelector(".vps-measure-apply");
+      const commitLiveBtn = wrap.querySelector(".vps-commit-live");
+      const clearCommitBtn = wrap.querySelector(".vps-clear-commit");
+
+      function updateCommitButton() {
+        commitLiveBtn.textContent = st.commitActive
+          ? "Committed Live -> output (queue to apply)"
+          : "Commit Live -> output";
+        commitLiveBtn.style.background = st.commitActive ? "#74b39c" : "#5f8f7d";
+      }
+      updateCommitButton();
 
       // Recomputing a full nearest-color remap on every mousemove (while
       // hovering the live preview with a tool active) was the cause of
-      // both the lag and the "adding doesn't seem to update" reports —
+      // both the lag and the "adding doesn't seem to update" reports -
       // it wasn't actually stuck, just re-doing an O(pixels*colors) pass
       // far more often than needed. Memoize on (frame, palette contents)
       // so it only recomputes when something that actually changes the
@@ -340,19 +434,48 @@ app.registerExtension({
         return reduced;
       }
 
+      function getSnappedReduced() {
+        const cached = st.snappedReducedCache[st.frameIdx];
+        if (cached) return cached;
+        const snapped = st.snappedCache[st.frameIdx];
+        if (!snapped) return null;
+        const targetW = st.grid?.cellsW || snapped.w;
+        const targetH = st.grid?.cellsH || snapped.h;
+        const reduced = nearestCanvasReduce(snapped.canvas, targetW, targetH);
+        st.snappedReducedCache[st.frameIdx] = reduced;
+        return reduced;
+      }
+
+      function getPostprocessMaskReduced() {
+        if (!st.postprocessActive) return null;
+        const cached = st.postprocessMaskReducedCache[st.frameIdx];
+        if (cached) return cached;
+        const mask = st.postprocessMaskCache[st.frameIdx];
+        const snapped = st.snappedCache[st.frameIdx];
+        if (!mask || !snapped) return null;
+        const targetW = st.grid?.cellsW || snapped.w;
+        const targetH = st.grid?.cellsH || snapped.h;
+        const reduced = nearestCanvasReduce(mask.canvas, targetW, targetH);
+        st.postprocessMaskReducedCache[st.frameIdx] = reduced;
+        return reduced;
+      }
+
       // With no palette edits, Live must be an exact visual control: use
       // the authoritative Python-generated Snapped frame itself. Merely
       // sharing a palette was not enough before, because the browser used
       // a median cell representative while Python may have used majority,
       // center weighting, dithering, and/or despeckle.
       //
-      // Once the palette differs, classify the block-reduced RAW image.
-      // That is intentionally retained instead of recoloring the old
-      // snapped cache: a newly added color could never win against pixels
-      // that had already been quantized under the old palette.
+      // Once the palette differs, classify the block-reduced RAW image so a
+      // newly added color can actually win. If a postprocess mask is supplied
+      // (notably Sel-Out.changed_outline), those cells are instead remapped
+      // from authoritative Snapped pixels after RAW classification. This
+      // preserves post-process geometry without preventing new colors from
+      // appearing in ordinary body cells.
       function computeLiveCanvas() {
         if (!st.livePalette.length) return null;
-        const cacheKey = st.frameIdx + "::" + st.livePalette.join(",");
+        const cacheKey = st.frameIdx + "::" + st.colorDistance + "::post=" +
+          (st.postprocessActive ? "1" : "0") + "::" + st.livePalette.join(",");
         if (st.liveCache.key === cacheKey) return st.liveCache.data;
 
         const snapped = st.snappedCache[st.frameIdx];
@@ -365,7 +488,9 @@ app.registerExtension({
           return snapped;
         }
 
-        liveLabel.textContent = "Live (edited preview)";
+        liveLabel.textContent = st.postprocessActive
+          ? "Live (edited + post-process)"
+          : "Live (edited preview)";
         liveLabel.style.color = "#e0a458";
         const reduced = getRawReduced();
         if (!reduced) return null;
@@ -373,9 +498,11 @@ app.registerExtension({
         const out = new ImageData(w, h);
         const paletteRGB = st.livePalette.map(hexToRgb);
         const workload = (w * h) * paletteRGB.length;
+        let lut = null;
+        let paletteSpace = null;
 
         if (workload > LUT_THRESHOLD) {
-          const lut = buildPaletteLUT(paletteRGB);
+          lut = buildPaletteLUT(paletteRGB, st.colorDistance);
           for (let i = 0; i < id.length; i += 4) {
             const idx = ((id[i] >> LUT_SHIFT) << (2 * LUT_BITS)) |
                         ((id[i + 1] >> LUT_SHIFT) << LUT_BITS) |
@@ -385,16 +512,52 @@ app.registerExtension({
             out.data[i + 2] = paletteRGB[best][2]; out.data[i + 3] = 255;
           }
         } else {
+          paletteSpace = paletteRGB.map((rgb) => colorVector(rgb, st.colorDistance));
           for (let i = 0; i < id.length; i += 4) {
             let best = 0, bestD = Infinity;
-            const r = id[i], g = id[i + 1], b = id[i + 2];
-            for (let p = 0; p < paletteRGB.length; p++) {
-              const [pr, pg, pb] = paletteRGB[p];
-              const d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
+            const value = colorVector([id[i], id[i + 1], id[i + 2]], st.colorDistance);
+            for (let p = 0; p < paletteSpace.length; p++) {
+              const d = colorDistanceSquared(value, paletteSpace[p]);
               if (d < bestD) { bestD = d; best = p; }
             }
             out.data[i] = paletteRGB[best][0]; out.data[i + 1] = paletteRGB[best][1];
             out.data[i + 2] = paletteRGB[best][2]; out.data[i + 3] = 255;
+          }
+        }
+
+        // Preserve Sel-Out (or another discrete post-process) exactly where
+        // its diagnostic mask says the authoritative Snapped image changed.
+        // Re-map those post-processed RGB values through the edited palette;
+        // copying the old RGB verbatim would leave removed/replaced swatches
+        // in the Live panel.
+        const postMask = getPostprocessMaskReduced();
+        const snappedReduced = postMask ? getSnappedReduced() : null;
+        if (postMask && snappedReduced &&
+            postMask.width === w && postMask.height === h &&
+            snappedReduced.width === w && snappedReduced.height === h) {
+          const md = postMask.data;
+          const sd = snappedReduced.data;
+          for (let i = 0; i < md.length; i += 4) {
+            if (md[i] < 128 && md[i + 1] < 128 && md[i + 2] < 128) continue;
+            let best;
+            if (lut) {
+              const idx = ((sd[i] >> LUT_SHIFT) << (2 * LUT_BITS)) |
+                          ((sd[i + 1] >> LUT_SHIFT) << LUT_BITS) |
+                          (sd[i + 2] >> LUT_SHIFT);
+              best = lut[idx];
+            } else {
+              const value = colorVector([sd[i], sd[i + 1], sd[i + 2]], st.colorDistance);
+              let bestD = Infinity;
+              best = 0;
+              for (let p = 0; p < paletteSpace.length; p++) {
+                const d = colorDistanceSquared(value, paletteSpace[p]);
+                if (d < bestD) { bestD = d; best = p; }
+              }
+            }
+            out.data[i] = paletteRGB[best][0];
+            out.data[i + 1] = paletteRGB[best][1];
+            out.data[i + 2] = paletteRGB[best][2];
+            out.data[i + 3] = 255;
           }
         }
 
@@ -421,6 +584,17 @@ app.registerExtension({
           }
         }
 
+        // The preview PNG now carries the authoritative RGBA result. Preserve
+        // its alpha for every edited Live cell; alpha=0 means the RGB beneath
+        // it is merely a hidden key/background value, not a restored backdrop.
+        const alphaReference = getSnappedReduced();
+        if (alphaReference && alphaReference.width === w && alphaReference.height === h) {
+          const ad = alphaReference.data;
+          for (let i = 0; i < out.data.length; i += 4) {
+            out.data[i + 3] = ad[i + 3] < 128 ? 0 : 255;
+          }
+        }
+
         const c = document.createElement("canvas");
         c.width = w; c.height = h;
         c.getContext("2d").putImageData(out, 0, 0);
@@ -428,6 +602,83 @@ app.registerExtension({
         st.liveCache = { key: cacheKey, data: result };
         return result;
       }
+
+      function canvasFingerprint(source) {
+        const data = source.canvas.getContext("2d", { willReadFrequently: true })
+          .getImageData(0, 0, source.w, source.h).data;
+        let hash = 2166136261;
+        for (let i = 0; i < data.length; i++) {
+          hash ^= data[i];
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return hash.toString(16).padStart(8, "0");
+      }
+
+      function writeCommitWidget(value) {
+        const widget = node.widgets?.find((w) => w.name === "committed_live_png");
+        if (!widget) return false;
+        widget.value = value;
+        widget.callback?.(value, appRef.canvas, node, undefined, undefined);
+        node.setDirtyCanvas?.(true, true);
+        return true;
+      }
+
+      function clearCommittedLive(showStatus = false) {
+        writeCommitWidget("");
+        st.commitActive = false;
+        updateCommitButton();
+        if (showStatus) {
+          statusEl.textContent = "Committed Live output cleared; outputs will pass through Snapped on the next queue.";
+        }
+      }
+
+      function invalidateCommittedLive() {
+        if (st.commitActive) clearCommittedLive(false);
+      }
+
+      function commitCurrentLive() {
+        if (st.totalFrames !== 1) {
+          statusEl.textContent = `Exact Live commit supports one still image only; current batch has ${st.totalFrames} frames.`;
+          return;
+        }
+        const raw = st.rawCache[0];
+        const snapped = st.snappedCache[0];
+        const live = computeLiveCanvas();
+        if (!raw || !snapped || !live) {
+          statusEl.textContent = "Live frame is not loaded yet; run the node and try Commit again.";
+          return;
+        }
+        const committed = document.createElement("canvas");
+        committed.width = snapped.w;
+        committed.height = snapped.h;
+        const ctx = committed.getContext("2d");
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, committed.width, committed.height);
+        ctx.drawImage(live.canvas, 0, 0, committed.width, committed.height);
+        const payload = {
+          version: 1,
+          batch: 1,
+          frame: 0,
+          width: committed.width,
+          height: committed.height,
+          raw_width: raw.w,
+          raw_height: raw.h,
+          raw_hash: canvasFingerprint(raw),
+          png: committed.toDataURL("image/png"),
+        };
+        if (!writeCommitWidget(JSON.stringify(payload))) {
+          statusEl.textContent = "Couldn't find the hidden committed_live_png widget; recreate the Live Editor node.";
+          return;
+        }
+        st.commitActive = true;
+        updateCommitButton();
+        statusEl.textContent =
+          "Exact Live frame committed. Queue Prompt once; then use this node's image/transparent_image output. " +
+          "Any further palette edit clears the commit and requires committing again.";
+      }
+
+      commitLiveBtn.addEventListener("click", commitCurrentLive);
+      clearCommitBtn.addEventListener("click", () => clearCommittedLive(true));
 
       function currentSource(key) {
         if (key === "live") return computeLiveCanvas();
@@ -494,6 +745,15 @@ app.registerExtension({
           c.getContext("2d").drawImage(img, 0, 0);
           st.rawCache[i] = { canvas: c, w: c.width, h: c.height };
         }
+        if (!st.postprocessMaskCache[i] && st.postprocessMaskRefs[i]) {
+          const img = await loadImage(refUrl(st.postprocessMaskRefs[i]));
+          const c = document.createElement("canvas");
+          c.width = img.naturalWidth; c.height = img.naturalHeight;
+          const ctx = c.getContext("2d");
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(img, 0, 0);
+          st.postprocessMaskCache[i] = { canvas: c, w: c.width, h: c.height };
+        }
       }
       async function goToFrame(i) {
         const n = st.frameRefs.length;
@@ -531,15 +791,16 @@ app.registerExtension({
             (selected
               ? `box-shadow:0 0 0 2px #0a0b0d, 0 0 0 4px #5fb3a3;`
               : `box-shadow:inset 0 0 0 1px rgba(255,255,255,0.15);`);
-          sw.title = st.tool === "replace" ? `${hex} — click to select for replacement` : `${hex} — click to remove`;
+          sw.title = st.tool === "replace" ? `${hex} - click to select for replacement` : `${hex} - click to remove`;
           sw.addEventListener("click", () => {
             if (st.tool === "replace") {
               st.replaceSource = i;
               renderPaletteRow();
               updateReplaceApplyState();
-              statusEl.textContent = `Replacing ${st.livePalette[i]} — click another color anywhere, or use manual entry + "Replace selected".`;
+              statusEl.textContent = `Replacing ${st.livePalette[i]} - click another color anywhere, or use manual entry + "Replace selected".`;
               return;
             }
+            invalidateCommittedLive();
             st.livePalette.splice(i, 1);
             st.paletteDirty = true;
             renderPaletteRow();
@@ -551,10 +812,11 @@ app.registerExtension({
       function addColorToPalette(value) {
         const hex = normalizeHex(value);
         if (!hex) {
-          statusEl.textContent = `Invalid color "${value}" — use a six-digit value such as #ff8800.`;
+          statusEl.textContent = `Invalid color "${value}" - use a six-digit value such as #ff8800.`;
           return;
         }
         if (!st.livePalette.some((h) => h.toLowerCase() === hex)) {
+          invalidateCommittedLive();
           st.livePalette.push(hex);
           st.paletteDirty = true;
           renderPaletteRow();
@@ -581,6 +843,7 @@ app.registerExtension({
           if (d < bestD) { bestD = d; best = i; }
         });
         const removed = st.livePalette[best];
+        invalidateCommittedLive();
         st.livePalette.splice(best, 1);
         st.paletteDirty = true;
         renderPaletteRow();
@@ -604,7 +867,7 @@ app.registerExtension({
       // that would mean patching raw PNG chunk structure (real risk of a
       // subtle encoding bug) and, more importantly, the core node's
       // custom_palette loader just reads unique pixel colors from
-      // whatever image it's given — any extra encoded pixels would leak
+      // whatever image it's given - any extra encoded pixels would leak
       // into the actual palette used for processing unless the Python
       // side were also taught to ignore them. localStorage keeps this
       // entirely on the editing side, with zero risk to the real
@@ -627,7 +890,7 @@ app.registerExtension({
       }
       function applySavedSubstitutions() {
         const rules = loadSubstitutions();
-        if (!rules.length) { statusEl.textContent = "No saved substitutions yet — use Replace at least once first."; return; }
+        if (!rules.length) { statusEl.textContent = "No saved substitutions yet - use Replace at least once first."; return; }
         const THRESHOLD = 40; // RGB-space distance; a rough "close enough to be the same intended color" cutoff
         let applied = 0;
         rules.forEach((rule) => {
@@ -640,11 +903,14 @@ app.registerExtension({
           });
           if (best >= 0 && bestD <= THRESHOLD) { st.livePalette[best] = rule.to; applied++; }
         });
-        if (applied) st.paletteDirty = true;
+        if (applied) {
+          invalidateCommittedLive();
+          st.paletteDirty = true;
+        }
         renderPaletteRow();
         redrawBox("live");
         statusEl.textContent = `Applied ${applied} of ${rules.length} saved substitution(s) ` +
-          `(others had no close-enough match in the current palette — that's expected on a very different scene).`;
+          `(others had no close-enough match in the current palette - that's expected on a very different scene).`;
       }
       wrap.querySelector(".vps-apply-saved-subst").addEventListener("click", applySavedSubstitutions);
       wrap.querySelector(".vps-clear-saved-subst").addEventListener("click", () => {
@@ -656,11 +922,12 @@ app.registerExtension({
         if (st.replaceSource == null || st.replaceSource >= st.livePalette.length) return;
         const targetHex = normalizeHex(value);
         if (!targetHex) {
-          statusEl.textContent = `Invalid replacement color "${value}" — use #rrggbb.`;
+          statusEl.textContent = `Invalid replacement color "${value}" - use #rrggbb.`;
           return;
         }
         const idx = st.replaceSource;
         const oldHex = st.livePalette[idx];
+        invalidateCommittedLive();
         st.livePalette[idx] = targetHex;
         st.paletteDirty = true;
         st.replaceSource = null;
@@ -668,7 +935,7 @@ app.registerExtension({
         renderPaletteRow();
         updateReplaceApplyState();
         redrawBox("live");
-        statusEl.textContent = `Replaced ${oldHex} → ${targetHex}. Remembered — "Apply saved substitutions" will try to reapply this on future palettes.`;
+        statusEl.textContent = `Replaced ${oldHex} -> ${targetHex}. Remembered - "Apply saved substitutions" will try to reapply this on future palettes.`;
       }
       function handleReplaceClick(hex) {
         if (!st.livePalette.length) return;
@@ -676,7 +943,7 @@ app.registerExtension({
           st.replaceSource = nearestPaletteIndex(hex);
           renderPaletteRow();
           updateReplaceApplyState();
-          statusEl.textContent = `Replacing ${st.livePalette[st.replaceSource]} — click another color anywhere, or use manual entry + "Replace selected".`;
+          statusEl.textContent = `Replacing ${st.livePalette[st.replaceSource]} - click another color anywhere, or use manual entry + "Replace selected".`;
         } else {
           applyReplace(hex);
         }
@@ -733,14 +1000,14 @@ app.registerExtension({
           return;
         }
         measureInfo.textContent =
-          `Distance: ${m.dist.toFixed(1)}px, target ${m.target} cells → pixel_size ≈ ${m.pixelSize.toFixed(2)}. ` +
-          `The node rounds this to a whole pixel on run (→ ${m.rounded}), giving ≈${m.actualCells.toFixed(1)} cells ` +
-          `instead of exactly ${m.target} — pixel-art grids can't use fractional block sizes, so this is as close as it gets.`;
+          `Distance: ${m.dist.toFixed(1)}px, target ${m.target} cells -> pixel_size ~ ${m.pixelSize.toFixed(2)}. ` +
+          `The node rounds this to a whole pixel on run (-> ${m.rounded}), giving ~${m.actualCells.toFixed(1)} cells ` +
+            `instead of exactly ${m.target} - pixel-art grids can't use fractional block sizes, so this is as close as it gets.`;
         measureApplyBtn.disabled = false;
       }
       measureTargetInput.addEventListener("input", updateMeasureInfo);
       // The pixel_size widget lives on the CORE VideoPixelSnapper node,
-      // not on this editor node — walk this node's inputs to find it.
+      // not on this editor node - walk this node's inputs to find it.
       // node.getInputNode is a standard LiteGraph graph-traversal API;
       // wrapped defensively since it's not something testable from here.
       function findCoreNode() {
@@ -776,7 +1043,7 @@ app.registerExtension({
           statusEl.textContent = `pixel_size on "${core.title || "Video Pixel Snapper"}" set to ${m.rounded}. Re-run to apply.`;
         } else {
           statusEl.textContent = `Couldn't find a connected Video Pixel Snapper node to set pixel_size on ` +
-            `automatically (this only works if this editor's inputs trace back to it directly) — set it to ` +
+            `automatically (this only works if this editor's inputs trace back to it directly) - set it to ` +
             `${m.rounded} manually instead.`;
         }
       });
@@ -812,6 +1079,10 @@ app.registerExtension({
           const hit = screenToSourcePixel(key, e.offsetX, e.offsetY);
           if (!hit) return;
           const d = hit.source.canvas.getContext("2d").getImageData(hit.sx, hit.sy, 1, 1).data;
+          if (d[3] < 16) {
+            pickSwatch.style.background = "transparent";
+            return;
+          }
           pickSwatch.style.background = rgbToHex(d[0], d[1], d[2]);
         });
 
@@ -833,6 +1104,10 @@ app.registerExtension({
           }
 
           const d = hit.source.canvas.getContext("2d").getImageData(hit.sx, hit.sy, 1, 1).data;
+          if (d[3] < 16) {
+            statusEl.textContent = "That preview pixel is transparent; its hidden RGB is not a visible palette color.";
+            return;
+          }
           const hex = rgbToHex(d[0], d[1], d[2]);
           if (st.tool === "pick") addColorToPalette(hex);
           else if (st.tool === "delete") removeNearestFromPalette(hex);
@@ -885,6 +1160,7 @@ app.registerExtension({
       wrap.querySelector(".vps-addcolor").addEventListener("click", () => addColorToPalette(hexInput.value));
 
       wrap.querySelector(".vps-reset").addEventListener("click", () => {
+        clearCommittedLive(false);
         st.livePalette = st.originalPalette.slice();
         st.paletteDirty = false;
         st.replaceSource = null;
@@ -914,7 +1190,7 @@ app.registerExtension({
           if (resp.ok) {
             const data = await resp.json();
             const shown = data.subfolder ? `${data.subfolder}/${data.name}` : data.name;
-            statusEl.textContent = `Saved as "${shown}" in input/ — pick it in LoadImage → custom_palette and re-run the graph.`;
+            statusEl.textContent = `Saved palette as "${shown}" in input/. A palette stores colors, not Live pixel assignments; use "Commit Live -> output" before Queue if you need this exact visible image on the node outputs.`;
           } else {
             statusEl.textContent = `Upload failed (HTTP ${resp.status}).`;
           }
@@ -925,7 +1201,10 @@ app.registerExtension({
 
       new ResizeObserver(() => redrawAll()).observe(wrap);
 
-      node._vpsInternal = { goToFrame, loadPaletteFromRef, redrawAll, renderPaletteRow, statusEl, frameCounter };
+      node._vpsInternal = {
+        goToFrame, loadPaletteFromRef, redrawAll, renderPaletteRow,
+        updateCommitButton, statusEl, frameCounter,
+      };
     };
 
     const origOnExecuted = nodeType.prototype.onExecuted;
@@ -939,23 +1218,44 @@ app.registerExtension({
           const raw = message?.vps_raw || [];
           const frames = message?.vps_frames || [];
           const palette = message?.vps_palette;
+          const totalFramesMsg = message?.vps_total_frames;
+          const postprocessMasks = message?.vps_postprocess_masks || [];
+          const postprocessActiveMsg = message?.vps_postprocess_active;
+          const commitActiveMsg = message?.vps_commit_active;
+          const commitInfoMsg = message?.vps_commit_info;
           // [block, phaseX, phaseY, cellsW?, cellsH?, scale?], only
           // present when the editor's optional `info` input is connected.
           const gridMsg = message?.vps_grid;
           const backgroundMsg = message?.vps_background;
+          const colorDistanceMsg = message?.vps_color_distance;
           if (!frames.length || !palette?.length) {
             internal.statusEl.textContent =
-              "No preview in the node's output — open ComfyUI's Logs panel (Ctrl+`) and look for " +
+              "No preview in the node's output - open ComfyUI's Logs panel (Ctrl+`) and look for " +
               "'[VideoPixelSnapper] preview save failed'.";
             log(`node ${node.id}: no vps_frames/vps_palette in message`);
             return;
           }
           node._vps.rawRefs = raw;
           node._vps.frameRefs = frames;
+          node._vps.totalFrames = Array.isArray(totalFramesMsg)
+            ? Number(totalFramesMsg[0] || frames.length)
+            : Number(totalFramesMsg || frames.length);
+          node._vps.postprocessMaskRefs = postprocessMasks;
+          const requestedPostprocess = Array.isArray(postprocessActiveMsg)
+            ? Boolean(postprocessActiveMsg[0])
+            : Boolean(postprocessActiveMsg);
+          node._vps.postprocessActive = requestedPostprocess && postprocessMasks.length > 0;
+          node._vps.commitActive = Array.isArray(commitActiveMsg)
+            ? Boolean(commitActiveMsg[0])
+            : Boolean(commitActiveMsg);
+          internal.updateCommitButton();
           node._vps.frameIdx = 0;
           node._vps.rawCache = {};
           node._vps.snappedCache = {};
+          node._vps.postprocessMaskCache = {};
           node._vps.rawReducedCache = {};
+          node._vps.snappedReducedCache = {};
+          node._vps.postprocessMaskReducedCache = {};
           node._vps.grid = Array.isArray(gridMsg) ? {
             block: gridMsg[0], phaseX: gridMsg[1], phaseY: gridMsg[2],
             cellsW: gridMsg[3] || null, cellsH: gridMsg[4] || null,
@@ -964,6 +1264,10 @@ app.registerExtension({
           node._vps.backgroundHex = Array.isArray(backgroundMsg)
             ? (backgroundMsg[0] || null)
             : (backgroundMsg || null);
+          const distanceValue = Array.isArray(colorDistanceMsg)
+            ? colorDistanceMsg[0] : colorDistanceMsg;
+          node._vps.colorDistance = distanceValue === "rgb_legacy"
+            ? "rgb_legacy" : "oklab";
           node._vps.liveCache = { key: null, data: null };
           node._vps.measurePoints = [];
           node._vps.view = { zoom: 1, panX: 0, panY: 0 };
@@ -978,13 +1282,23 @@ app.registerExtension({
           }
           internal.renderPaletteRow();
           await internal.goToFrame(0);
+          const postprocessNote = node._vps.postprocessActive
+            ? ` Sel-Out/post-process mask active for edited Live.`
+            : ``;
+          const commitInfoValue = Array.isArray(commitInfoMsg)
+            ? String(commitInfoMsg[0] || "") : String(commitInfoMsg || "");
+          const commitNote = node._vps.commitActive
+            ? ` Exact committed Live PNG is driving this node's outputs.`
+            : (commitInfoValue.includes("commit rejected")
+                ? ` Commit was rejected safely; outputs use Snapped. Clear and recommit.`
+                : ``);
           internal.statusEl.textContent = `${node._vps.livePalette.length} colors, ${frames.length} frame(s). ` +
-            `Live exactly matches Snapped until the palette colors change. ` +
-            `Pick/Delete/Replace/Measure — click any preview.`;
-          log(`node ${node.id}: preview loaded OK (${node._vps.livePalette.length} colors, ${frames.length} frames)`);
+            `Live exactly matches Snapped until the palette colors change.${postprocessNote}${commitNote} ` +
+            `Pick/Delete/Replace/Measure - click any preview.`;
+          log(`node ${node.id}: preview loaded OK (${node._vps.livePalette.length} colors, ${frames.length} frames, postprocess=${node._vps.postprocessActive})`);
         } catch (err) {
           internal.statusEl.textContent = "Preview load failed: " + (err?.message || err);
-          log(`node ${node.id}: ERROR — ${err?.message || err}`);
+          log(`node ${node.id}: ERROR - ${err?.message || err}`);
         }
       })();
     };

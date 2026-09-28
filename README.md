@@ -40,6 +40,16 @@ palette edits.
   second background-removal pass and no soft fringe.
 - **RGBA sprite sheets**: a focused row-major assembler preserves every frame
   and alpha value without resizing or blending.
+- **Palette coverage analysis**: measures Oklab error against original masked
+  character cells, selects a master-only subpalette, reports missing observed
+  ramps and near-duplicate master slots without modifying the master.
+- **Palette-locked selective outlining for stills**: replaces black outer and
+  optionally internal linework with darker material-related colors already in
+  a supplied palette. Manual or per-image automatic light direction is
+  supported; RGB, RGBA, and optional masks preserve hard pixel edges.
+- **True RGBA still loader**: bypasses standard Load Image's RGB/MASK split,
+  optionally zeroes invisible RGB under alpha=0, and lets Core/Analyzer consume
+  embedded PNG alpha without a separate mask wire.
 - **Motion-aware discrete cleanup**: estimates bidirectional motion from
   the original video, rejects occlusions/flow errors, and stabilizes palette
   labels along trajectories without RGB blending—including external outlines,
@@ -50,11 +60,14 @@ palette edits.
 ## Installation
 
 ```
-ComfyUI/custom_nodes/ComfyUI-VideoPixelSnapper/
+ComfyUI/custom_nodes/ComfyUI-Video-Pixel-Snapper/
 ├── __init__.py
 ├── video_pixel_snapper.py
 ├── frame_retimer.py
 ├── temporal_denoise.py
+├── palette_analyzer.py
+├── selective_outline.py
+├── rgba_loader.py
 ├── sprite_sheet.py
 └── web/
     ├── video_pixel_snapper.js
@@ -76,9 +89,12 @@ it; upscale with nearest-neighbor only after cleanup/retiming if needed.
 
 ## Node: `Video Pixel Snapper`
 
-**Input:** `image` (a batch of same-size frames). Optional
-`custom_palette` (IMAGE) — if connected, the palette is read from its
-unique colors and `k_colors`/`accent_slots` are ignored.
+**Input:** `image` (a batch of same-size RGB or RGBA frames). Nontrivial
+embedded RGBA alpha is used automatically when no explicit foreground mask is
+connected. Standard ComfyUI Load Image emits RGB plus a separate MASK, so use
+that MASK or the focused `Load RGBA Image` node. Optional `custom_palette`
+(IMAGE) — if connected, the palette is read from its unique colors and
+`k_colors`/`accent_slots` are ignored.
 
 **Grid parameters:**
 - `pixel_size` — `0.0` = auto-detect using `grid_detection_mode` below;
@@ -99,6 +115,10 @@ unique colors and `k_colors`/`accent_slots` are ignored.
     sensitive to per-frame AI noise — prefer `majority` for video.
 - `despeckle` — removes single cells that disagree with all 4
   neighbors. Off by default (can also erase an intentional 1px highlight).
+- `color_distance`:
+  - `oklab` (recommended) selects the palette entry that looks perceptually
+    closest and strongly reduces wrong-hue snaps;
+  - `rgb_legacy` preserves the old Euclidean encoded-RGB behavior.
 
 **Palette parameters:**
 - `k_colors` — palette size (ignored when `custom_palette` is connected).
@@ -145,6 +165,14 @@ The original `image` output remains RGB for compatibility. Use the appended
 RGBA `transparent_image` for Cleanup and export. `transparency_mask` follows
 ComfyUI's Load Image convention: `1` is transparent and `0` is opaque.
 
+**Transparent mode always forces `scale=1`.** A batch of 32 float32 RGBA frames
+at 5184×2736 alone requires 7.26 GB, before the RGB source, mask, previews, and
+ComfyUI cache. Cleanup also requires cell scale 1. Build and retime at native
+pixel-art resolution; if a large presentation image is needed, use
+nearest-neighbor scaling only after Sprite Sheet, where just one sheet tensor
+must be enlarged. The `info` output reports
+`transparent_scale=forced_1x(requested=...)` when a larger setting was ignored.
+
 **Other:** `sample_frames`, `dither` (`bayer2/4/8` — deterministic, does
 not flicker across frames, unlike Floyd–Steinberg), `output_scale_mode`
 (`manual` / `match_width` / `match_height` / `match_pixel_count`),
@@ -153,6 +181,194 @@ not flicker across frames, unlike Floyd–Steinberg), `output_scale_mode`
 **Outputs:** existing `image`, `palette_preview`, and `info`, followed by
 `transparent_image` (RGBA) and `transparency_mask`. Feed `palette_preview` back
 as `custom_palette` after editing; use RGBA only on the alpha-aware branch.
+Custom strips retain their first-occurrence swatch order in `palette_preview`
+and Live Editor.
+
+### Why an available palette color may not be selected
+
+The core classifies all source samples in a cell and then applies the chosen
+cell method; it does not search by color name or by visual intent. Legacy RGB
+distance can also cross hue families. For example, source orange `#E4954B` is
+numerically closer in encoded RGB to salmon `#EF7D57` than to the orange bridge
+`#EA8A2E`, even though the latter looks more faithful. `color_distance=oklab`
+selects `#EA8A2E` for that case. An exactly equal source pixel still maps to its
+exact palette entry in either mode.
+
+Start custom-palette evaluation with `oklab`, `majority`, and `dither=none`.
+Only enable Bayer dithering afterward if additional texture is desired; dither
+cannot repair a wrong distance metric and makes one-to-one comparisons harder.
+
+## Node: `Palette Coverage Analyzer`
+
+This separate diagnostic node answers two different questions without silently
+changing your global palette:
+
+1. Which existing master colors form the best subpalette for this character?
+2. Which observed foreground color families are genuinely missing from master,
+   and which current master slots are near-duplicates that could be replaced?
+
+Standalone wiring (no Pixel Snapper required):
+
+```text
+16-render IMAGE batch ───────────────> Palette Coverage Analyzer.image
+matching foreground MASK batch ─────> Palette Coverage Analyzer.foreground_mask
+Load Image: master palette PNG ──────> Palette Coverage Analyzer.master_palette
+analysis_pixel_size = measured block size (for example 5)
+```
+
+`analysis_pixel_size=0` auto-detects one shared block size from the sampled
+batch; a measured manual value is more reliable. Shared phase is still
+estimated across the renders. Optional `snapper_info` is only a compatibility
+shortcut: when connected and source dimensions match, its exact block, phase,
+crop, and mask thresholds take precedence. It is not required.
+
+Controls:
+
+- `subpalette_size`: existing master entries to retain for this character;
+- `analysis_pixel_size`: manual source block size, or `0` for auto-detection;
+- `mask_threshold` / `mask_cell_threshold`: standalone mask sampling and cell
+  coverage thresholds; ignored when compatible `snapper_info` is used;
+- `suggestion_count`: maximum observed gap colors to show for review;
+- `sample_frames`: evenly spaced frames, each with equal total weight;
+- `missing_threshold`: Oklab distance counted as a visible coverage gap (`0.06`
+  is a practical starting point);
+- `duplicate_threshold`: pairs closer than this are reported as possible slot
+  replacements (`0.03` default);
+- `heatmap_limit`: error shown as full red (`0.12` default).
+
+Outputs:
+
+- `error_heatmap`: black background; blue means well covered, green is
+  intermediate, red reaches/exceeds the heatmap limit;
+- `suggested_subpalette`: only colors already present in master, selected with
+  a weighted coverage objective and returned in master-strip order;
+- `missing_color_suggestions`: observed 8-bit cell medoids representing
+  uncovered clusters. Near-match resize residues and sub-24 near-black values
+  (when master contains black) are suppressed. Suggestions are evidence for a missing *ramp*,
+  not instructions to append every swatch;
+- `info`: mean/median/p95/max error, gap-cell percentage, suggestion coverage
+  counted only within threshold-qualified gap cells, nearest master colors, and
+  near-duplicate master pairs.
+
+The analyzer never edits master automatically. Save a reviewed subpalette or
+suggestion strip and load it on a later run; connecting it back into the same
+core while also consuming that core's `info` would create a graph cycle.
+
+## Node: `Load RGBA Image`
+
+ComfyUI's standard `Load Image` separates a transparent PNG into RGB `IMAGE`
+and a separate `MASK`; the IMAGE socket alone contains no alpha, so no
+downstream node can recover it automatically. `VideoPixelSnapperLoadRGBA` is a
+focused still loader that emits both forms:
+
+- `image`: compatibility RGB;
+- `transparent_image`: true four-channel RGBA IMAGE;
+- `foreground_mask`: alpha (`1=opaque`), ready for Core/Analyzer;
+- `transparency_mask`: Comfy convention (`1=transparent`);
+- `info`: alpha statistics and hidden-RGB handling.
+
+Recommended one-wire alpha path:
+
+```text
+Load RGBA Image.transparent_image -> Video Pixel Snapper.image
+Video Pixel Snapper.transparent_image -> Selective Outline.image
+Selective Outline.transparent_image -> Live Editor.snapped_image
+```
+
+Core and Palette Coverage Analyzer automatically use nontrivial embedded RGBA
+alpha when no explicit `foreground_mask` is connected. Fully opaque RGBA does
+not activate masking. Standard Load Image still requires its MASK to be wired
+(or inverted for a white-foreground input), because its IMAGE output is RGB by
+design.
+
+`sanitize_hidden_rgb=true` changes RGB only where alpha is exactly zero. This
+is visually lossless but prevents Photoshop's hidden white/magenta mattes from
+reappearing if any later RGB-only preview or node drops alpha. Partial-alpha and
+opaque pixels remain byte-identical. Core continues to emit deliberately hard
+cell-level alpha; the loader itself preserves the source's soft alpha.
+
+## Node: `Selective Outline / Sel-Out`
+
+`VideoPixelSnapperSelectiveOutline` is a focused, model-free still-image node.
+It detects black line pixels and replaces them with darker colors related to
+the adjacent body material. Every replacement is an exact entry from the
+connected `palette`; the node never averages, interpolates, or invents an RGB
+shade. A batch is accepted for ComfyUI convenience, but each image is processed
+independently—there is no temporal state or cross-image palette decision.
+
+Recommended wiring after snapping a single sprite:
+
+```text
+Video Pixel Snapper.image/transparent_image ──> Selective Outline.image
+Video Pixel Snapper.info ─────────────────────> Selective Outline.snapper_info
+16/24-color character subpalette strip ───────> Selective Outline.palette
+foreground mask (when needed) ────────────────> Selective Outline.foreground_mask
+```
+
+With `input_pixel_scale=0`, compatible `snapper_info` supplies the exact core
+`output_scale`. For scale greater than one the node first collapses every exact
+nearest-neighbor block to one logical pixel, performs Sel-Out on that logical
+grid, then restores the original dimensions by exact nearest-neighbor repeat.
+This makes the complete N×N outline cell change together instead of recoloring
+only its outermost raster row. If `info` is unavailable, set
+`input_pixel_scale` manually to the core output scale; set it to `1` for native
+pixel resolution.
+
+The scaled path intentionally rejects images that are not an exact
+nearest-neighbor enlargement (apart from a one-level PNG tolerance). It will not
+silently collapse bilinear, antialiased, or incorrectly declared input. Run
+Sel-Out before such presentation scaling.
+
+Controls:
+
+- `outline_scope=outer_only` changes eligible dark pixels only on the external
+  one-pixel silhouette. `outer_and_internal` also changes thin internal black
+  linework; use it carefully around pupils, mouths, and intentionally black
+  filled details.
+- `lighting_mode=manual` uses `light_direction` and is deterministic.
+  `auto` estimates an independent eight-way direction for each still from the
+  centroid of its brightest non-outline material pixels. This is a heuristic:
+  a large white costume can dominate it, so the `info` output reports the
+  inferred direction and confidence and manual mode remains the recommended
+  production setting.
+- `style=subtle/balanced/strong` controls how light the lit-side replacement may
+  become. Start with `balanced`; `subtle` stays closer to a conventional dark
+  outline, while `strong` produces a more visible sel-out.
+- `black_threshold` is the maximum value allowed in every 8-bit RGB channel.
+  Use `0` for exact `#000000`, the default `12` for tiny near-black residue, or
+  roughly `37–40` when deliberately targeting `#181425` (its largest channel
+  is hex `25` = decimal `37`).
+- `mask_meaning` supports both white-foreground RMBG/BiRefNet masks and
+  ComfyUI Load Image masks where white means transparency.
+- `input_pixel_scale=0` reads scale from `snapper_info`; positive values are a
+  manual override. The `info` output reports `scale_source`, logical dimensions,
+  and the restored output dimensions.
+
+Foreground detection priority is: connected mask, then incoming RGBA alpha,
+then a conservative flood fill of the dominant near-flat RGB border color.
+A mask/alpha is strongly recommended when the sprite touches the canvas edge,
+the background is textured, or the background and outline have similar dark
+colors. Plain RGB fallback is only intended for one still on a flat backdrop.
+For a scaled masked core result, prefer its output-resolution
+`transparency_mask` with `mask_meaning=white_is_transparent`; this keeps the
+logical silhouette aligned with the scaled snapped cells.
+
+Outputs:
+
+- `image`: RGB result, retaining the original background;
+- `transparent_image`: RGBA result. Existing input alpha is preserved; a
+  connected mask supplies thresholded hard 0/1 alpha so a soft removal fringe
+  is not reintroduced; plain RGB fallback remains fully opaque and does not
+  silently remove its inferred background;
+- `changed_outline`: mask of exactly the pixels recolored;
+- `info`: mask source, scope, light direction/confidence, candidate/change
+  counts, and unresolved dark pixels.
+
+The technique is selective outlining (`sel-out`), not literal RGB-negative
+inversion. Lit-facing silhouette sections select a lighter dark from the local
+material family; shadow-facing sections select a deeper tinted dark. The node
+only recolors existing line pixels—it does not grow, smooth, antialias, or break
+the silhouette.
 
 ## Two nodes: core processing vs. live editor
 
@@ -179,12 +395,46 @@ Wire it up like this:
            info             <- core node's `info` output (recommended)
 ```
 
+When Selective Outline sits before Live Editor, use:
+
+```text
+original/pre-snap IMAGE ─────────────────────> Live Editor.original_image
+Load Image MASK (white=transparent) ─────────> Live Editor.original_transparency_mask
+Selective Outline.transparent_image ────────> Live Editor.snapped_image
+active character palette strip ─────────────> Live Editor.palette_preview
+Video Pixel Snapper.info ───────────────────> Live Editor.info
+Selective Outline.changed_outline ──────────> Live Editor.postprocess_mask
+```
+
+The optional `postprocess_mask` fixes edited-preview fallback through Sel-Out.
+With no palette change, Live still displays the authoritative `snapped_image`
+exactly. After Add/Delete/Replace, ordinary body cells are reclassified from
+RAW so new colors can appear, while mask-selected outline cells are
+reclassified from the authoritative Sel-Out result. Thus the edited Live panel
+keeps the selective-outline geometry instead of returning those cells to raw
+black. The browser preview still does not duplicate the full Python Sel-Out
+material/light solver; save the palette, feed it to both Pixel Snapper and
+Selective Outline, then re-run for the authoritative result.
+
+ComfyUI's standard `Load Image` separates an alpha PNG into an RGB `IMAGE` and a
+`MASK` where white means transparent. Alpha does not erase the RGB stored under
+transparent pixels. Connect that MASK to the optional
+`original_transparency_mask` if the Original browser panel should display true
+transparency. Feed `Selective Outline.transparent_image`, not its compatibility
+RGB `image`, to downstream alpha-aware nodes. Live Editor now saves RGBA preview
+PNGs, preserves authoritative alpha after palette edits, and draws its three
+canvases over a checkerboard; transparent hidden RGB is no longer shown as a
+mysteriously restored background.
+
 The first three image connections are required. Connecting `info` is
 optional but recommended: it gives the browser widget the exact detected
 block size, phase, cell dimensions, and output scale. Without it, Live
 uses a centered best-effort reduction and may not line up with Snapped.
-The editor node passes `snapped_image` through as its own `image` output,
-so it can also sit inline in the middle of a chain.
+Normally the editor passes `snapped_image` through unchanged. For a single
+still, **Commit Live → output** serializes the exact current Live canvas into a
+hidden workflow value; after one Queue, the existing RGB/RGBA/mask outputs
+materialize that committed image instead. The appended `commit_info` output
+states whether output is pass-through or an exact committed browser PNG.
 
 `max_preview_frames` (on the editor node) caps how many frames the
 frame-paging controls can page through — default 24. Each one is
@@ -206,7 +456,12 @@ The widget on the editor node:
   reuses the authoritative Snapped frame, so those two panels are
   pixel-identical. Palette comparison is based on the color set, not swatch
   order. After an actual color edit, Live switches to RAW-based cell
-  reclassification so newly added colors can appear immediately.
+  reclassification so newly added colors can appear immediately. If the
+  optional `postprocess_mask` is connected, those selected cells instead use
+  palette-remapped authoritative Snapped pixels, preserving Sel-Out or another
+  discrete post-process in the edited preview. RAW median reduction excludes
+  samples below alpha 0.5, so white/magenta RGB hidden under transparent
+  Photoshop pixels cannot influence visible palette assignments.
   Nearest-color lookup is exact below ~15M cell×color operations; above
   that it switches to a quantized lookup table for speed. The edited Live
   path is still an approximation of the core `majority`/dither logic; the
@@ -251,14 +506,27 @@ The widget on the editor node:
   grids, not a bug in the tool.
 - **Manual color entry** via the browser/OS native color picker + hex
   field.
-- **Save as custom_palette**: uploads the edited palette into ComfyUI's
+- **Commit Live → output** (single-image input): captures the exact visible
+  Live canvas—including Sel-Out structure and alpha—at the Snapped output
+  dimensions. Queue Prompt once afterward, then take this node's `image` or
+  `transparent_image` output. The committed PNG is stored in a hidden serialized
+  widget. Original/output dimensions guard against accidental stale reuse;
+  the byte fingerprint is diagnostic only because browser premultiplied-alpha
+  round-trips can legitimately differ from Torch at transparent edges. Any
+  later palette edit clears the commit; commit again when the Live look is
+  final. `Clear commit` restores
+  ordinary Snapped pass-through.
+- **Save as custom_palette**: uploads only the edited *color list* into ComfyUI's
   `input/` folder (via the standard `/upload/image` endpoint, with an
   editable subfolder + filename), ready to pick up in a `LoadImage`
   node feeding the core node's `custom_palette` input. Type is fixed to
   `input` — `LoadImage` only lists files from `input/`, so anything else
-  would be invisible right where you need it. There's no way to reach an
-  arbitrary filesystem path from browser JS — this is a genuine platform
-  limit, not a corner we cut.
+  would be invisible right where you need it. A palette PNG cannot encode
+  which color each source cell selected; reloading it into Core legitimately
+  re-runs Core's majority/median logic and may not reproduce Live's RAW-based
+  approximation. Use Commit Live when exact cell assignments matter. There's
+  no way to reach an arbitrary filesystem path from browser JS — this is a
+  genuine platform limit, not a corner we cut.
 - **+/− buttons** to resize the preview height (60–400px) — the node
   grows to fit, since this is a normal DOM widget.
 
@@ -371,8 +639,10 @@ is no scaling, interpolation, palette conversion, or RGB/alpha blending.
 Unused cells in the final row and all padding remain transparent.
 
 Outputs are `sprite_sheet`, a summary string, and integer frame width, frame
-height, columns, and rows. Connect `sprite_sheet` to ComfyUI's standard
-`Save Image`; with RGBA input the file is a transparent PNG.
+height, columns, and rows. Connect `sprite_sheet` directly to ComfyUI's
+standard `Save Image` for a native-resolution transparent PNG. For a larger
+presentation sheet, insert nearest-neighbor Image Scale between these two
+nodes; do not upscale every frame before assembling the sheet.
 
 Recommended transparent chain:
 
@@ -413,7 +683,7 @@ doesn't do pixel painting — no room for a usable canvas at that size).
   which reports the grid size actually used), open an issue.
 
 - **Widget doesn't appear / preview stays empty**: open
-  `http://127.0.0.1:8188/extensions/ComfyUI-VideoPixelSnapper/video_pixel_snapper.js`
+  `http://127.0.0.1:8188/extensions/ComfyUI-Video-Pixel-Snapper/video_pixel_snapper.js`
   directly in a browser tab while ComfyUI is running (adjust host/port
   if different). If you see the JS source, the file is being served
   correctly and the issue is elsewhere — open an issue with your
@@ -665,6 +935,50 @@ single-cell changes much better than side-by-side playback.
 
 ## Recent fixes
 
+- **v2.6.2 makes Load RGBA Image visible on ComfyUI 0.33.x.** Input-file
+  enumeration now uses the stable input-directory API instead of the unavailable
+  `folder_paths.get_input_files()` call.
+- **v2.6.1 fixes release-folder ambiguity.** The ZIP now installs as
+  `ComfyUI-Video-Pixel-Snapper` and startup logs explicitly confirm nine nodes
+  plus `RGBA loader=yes`.
+- **v2.6.0 adds a true RGBA still loader and embedded-alpha processing.** Hidden
+  Photoshop RGB under alpha=0 is ignored/sanitized instead of becoming white
+  versus magenta Live regions; Core/Analyzer accept RGBA without a mask wire.
+- **v2.5.2 accepts valid Commit canvases despite browser alpha-rounding.** Exact
+  browser/Torch source-hash mismatch is diagnostic rather than fatal, and every
+  invalid hidden payload falls back to Snapped instead of crashing the graph.
+- **v2.5.1 restores the Live Editor frontend.** A stray invalid trailer made
+  browsers reject the v2.5.0 ES module before widget registration; validation
+  now forces `.mjs` grammar and includes a DOM lifecycle smoke test.
+- **Commit Live → output materializes the exact visible single-image edit.** A
+  palette saves colors but not cell assignments; commit stores the actual Live
+  RGBA canvas and emits it after the next Queue.
+- **Live Editor no longer makes alpha-zero RGB look like a restored background.**
+  Snapped/Live preview PNGs retain RGBA, edited Live preserves authoritative
+  alpha, and `original_transparency_mask` restores alpha in the Original panel.
+- **Sel-Out now processes `output_scale > 1` on the logical cell grid.** Connect
+  core `info` and leave `input_pixel_scale=0`, or set the known scale manually;
+  whole nearest-neighbor blocks are recolored together and restored exactly.
+- **Live Editor now preserves Sel-Out after Add/Delete/Replace.** Connect
+  `Selective Outline.changed_outline` to the new optional
+  `Live Editor.postprocess_mask`; edited body cells still use RAW so new colors
+  can appear, while outline cells retain the post-process structure.
+- **Selective Outline / Sel-Out now recolors still-image linework from a fixed
+  palette.** It supports outer-only or outer+internal scope, manual/auto light,
+  RGB/RGBA/masks, exact changed-pixel diagnostics, and no off-palette output
+  replacements.
+- **Palette Coverage Analyzer now runs standalone.** Set the measured
+  `analysis_pixel_size` and feed the render/mask batches directly; core
+  `snapper_info` is optional.
+- **Palette Coverage Analyzer replaces ad-hoc palette expansion.** It reports
+  exact cell-level Oklab gaps, master-only character subpalettes, and redundant
+  master slots without modifying the palette automatically.
+- **Oklab perceptual matching prevents wrong-hue palette snaps.** The supplied
+  fox orange now selects the orange ramp instead of a numerically close salmon;
+  `rgb_legacy` remains available for comparison.
+- **Transparent mode no longer builds multi-gigabyte duplicate batches.** It
+  forces cell scale 1, writes chunks into one RGBA allocation, and exposes RGB
+  as a zero-copy view; Live Editor/Retimer also reuse incoming RGBA storage.
 - **Hard-alpha PNG now survives the complete graph.** Core, Cleanup, Live
   Editor, and Retimer append RGBA/mask outputs while preserving their existing
   RGB outputs for compatibility.
@@ -711,6 +1025,9 @@ single-cell changes much better than side-by-side playback.
 - **Snapped and Live now match exactly before palette edits.** The Live
   panel uses the authoritative Snapped frame while its palette is unchanged,
   rather than independently approximating Python's cell-reduction method.
+- **Core and edited Live preview now share Oklab/RGB matching.** Edited Live is
+  still a fast median-cell approximation, but no longer uses a different
+  nearest-color metric from the Python core.
 - **All nodes use their own category** (`Video Pixel
   Snapper`) in the Add Node menu, instead of sitting in the generic
   `image/transform` folder.
@@ -767,6 +1084,9 @@ more substantial features in one pass isn't a good way to keep that up):
 
 ## Known limitations
 
+- Coverage suggestions describe the analyzed clips only. A production global
+  palette must be calibrated on representative original frames/masks from many
+  character hue families; do not freeze master from screenshots or one sprite.
 - Transparent export is hard cell-level alpha intended for PNG and sprite
   sheets. H.264/MP4 does not preserve it; use the parallel RGB output for VHS.
 - Not every third-party ComfyUI image node accepts four-channel IMAGE tensors.

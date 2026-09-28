@@ -35,6 +35,9 @@ Adapted techniques and where they come from:
 Install: drop this folder into ComfyUI/custom_nodes/ and restart ComfyUI.
 """
 
+import base64
+import io
+import json
 import os
 import re
 import torch
@@ -319,14 +322,44 @@ def crop_bounds(h: int, w: int, block: int, phase_y: int, phase_x: int):
 # 2. Nearest-palette classification (chunked to bound memory)
 # ----------------------------------------------------------------------
 
-def nearest_palette_index(flat: torch.Tensor, palette: torch.Tensor, chunk: int = 200_000) -> torch.Tensor:
+def _rgb_to_oklab(rgb: torch.Tensor) -> torch.Tensor:
+    """Convert normalized sRGB to Oklab for perceptual nearest-color search."""
+    x = rgb[..., :3].float().clamp(0.0, 1.0)
+    linear = torch.where(
+        x <= 0.04045,
+        x / 12.92,
+        ((x + 0.055) / 1.055).pow(2.4),
+    )
+    r, g, b = linear.unbind(dim=-1)
+    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l_, m_, s_ = torch.sign(l) * l.abs().pow(1 / 3), torch.sign(m) * m.abs().pow(1 / 3), torch.sign(s) * s.abs().pow(1 / 3)
+    return torch.stack([
+        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+    ], dim=-1)
+
+
+def nearest_palette_index(
+    flat: torch.Tensor,
+    palette: torch.Tensor,
+    chunk: int = 200_000,
+    color_distance: str = "rgb_legacy",
+) -> torch.Tensor:
+    """Nearest palette label in legacy RGB or perceptual Oklab space."""
+    use_oklab = color_distance == "oklab"
+    palette_space = _rgb_to_oklab(palette) if use_oklab else palette.float()
     n = flat.shape[0]
     if n <= chunk:
-        return torch.cdist(flat, palette).argmin(dim=1)
+        values = _rgb_to_oklab(flat) if use_oklab else flat.float()
+        return torch.cdist(values, palette_space).argmin(dim=1)
     out = torch.empty(n, dtype=torch.long, device=flat.device)
     for i in range(0, n, chunk):
         j = min(i + chunk, n)
-        out[i:j] = torch.cdist(flat[i:j], palette).argmin(dim=1)
+        values = _rgb_to_oklab(flat[i:j]) if use_oklab else flat[i:j].float()
+        out[i:j] = torch.cdist(values, palette_space).argmin(dim=1)
     return out
 
 
@@ -485,10 +518,20 @@ def build_palette(pool_colors: torch.Tensor, pool_saliency: torch.Tensor, k_colo
 
 def palette_from_image(custom_palette: torch.Tensor, cap: int, seed: int) -> torch.Tensor:
     flat = custom_palette.reshape(-1, custom_palette.shape[-1])[:, :3]
-    uniq = torch.unique(flat, dim=0)
-    if uniq.shape[0] > cap:
-        uniq = kmeans(uniq, cap, seed=seed)
-    return uniq
+    uniq, inverse = torch.unique(flat, dim=0, return_inverse=True)
+    if uniq.shape[0] <= cap:
+        # torch.unique sorts rows, which scrambled carefully arranged ramp
+        # strips in Live Editor. Restore first-occurrence order without
+        # changing the actual color set used for quantization.
+        first = torch.full(
+            (uniq.shape[0],), flat.shape[0], device=flat.device, dtype=torch.long
+        )
+        first.scatter_reduce_(
+            0, inverse, torch.arange(flat.shape[0], device=flat.device),
+            reduce="amin", include_self=True,
+        )
+        return uniq[first.argsort()]
+    return kmeans(uniq, cap, seed=seed)
 
 
 def make_palette_preview(palette: torch.Tensor, swatch: int = 32) -> torch.Tensor:
@@ -522,19 +565,26 @@ def _cell_kernel(block: int, kind: str, device) -> torch.Tensor:
     return torch.exp(-dist2 / (2 * sigma2)).reshape(-1)
 
 
-def weighted_vote_reduce(cropped: torch.Tensor, block: int, palette: torch.Tensor, kind: str,
-                         margin: float = 0.05, pixel_mask: torch.Tensor = None):
+def weighted_vote_reduce(
+    cropped: torch.Tensor, block: int, palette: torch.Tensor, kind: str,
+    margin: float = 0.05, pixel_mask: torch.Tensor = None,
+    color_distance: str = "rgb_legacy",
+):
     b, ch, cw, c = cropped.shape
     oh, ow = ch // block, cw // block
 
     # A 1x1 cell has nothing to vote over.
     if block == 1:
-        return nearest_palette_index(cropped.reshape(-1, c), palette).reshape(b, oh, ow)
+        return nearest_palette_index(
+            cropped.reshape(-1, c), palette, color_distance=color_distance
+        ).reshape(b, oh, ow)
 
     n_cells = b * oh * ow
     pixels = cropped.reshape(b, oh, block, ow, block, c).permute(0, 1, 3, 2, 4, 5)
     pixels = pixels.reshape(n_cells, block * block, c)
-    idx_px = nearest_palette_index(cropped.reshape(-1, c), palette)
+    idx_px = nearest_palette_index(
+        cropped.reshape(-1, c), palette, color_distance=color_distance
+    )
     idx_px = idx_px.reshape(b, oh, block, ow, block).permute(0, 1, 3, 2, 4)
     idx_px = idx_px.reshape(n_cells, block * block)
 
@@ -564,7 +614,9 @@ def weighted_vote_reduce(cropped: torch.Tensor, block: int, palette: torch.Tenso
     else:
         mask_f = valid.to(cropped.dtype).unsqueeze(-1)
         mean_rgb = (pixels * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
-    fallback_idx = nearest_palette_index(mean_rgb, palette)
+    fallback_idx = nearest_palette_index(
+        mean_rgb, palette, color_distance=color_distance
+    )
 
     final_idx = torch.where(ambiguous, fallback_idx, winner_idx)
     return final_idx.reshape(b, oh, ow)
@@ -613,7 +665,9 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
                   out_h: int, out_w: int, foreground_mask: torch.Tensor = None,
                   mask_threshold: float = 0.5, mask_cell_threshold: float = 0.25,
                   background_index: int = None,
-                  return_foreground_mask: bool = False) -> torch.Tensor:
+                  return_foreground_mask: bool = False,
+                  return_rgba: bool = False,
+                  color_distance: str = "rgb_legacy") -> torch.Tensor:
     """Apply one fixed grid/palette, automatically chunking long clips.
 
     ``nearest_palette_index`` already chunks its distance matrix, but the
@@ -640,8 +694,18 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
     if dither != "none":
         dither_tile = _bayer_tile(dither, ch, cw, images.device) * dither_strength(palette)
 
-    outputs = []
-    foreground_outputs = []
+    output_channels = 4 if return_rgba else 3
+    result = torch.empty(
+        (b, out_h, out_w, output_channels),
+        device=images.device,
+        dtype=images.dtype,
+    )
+    foreground_result = None
+    if return_foreground_mask and not return_rgba:
+        foreground_result = torch.empty(
+            (b, out_h, out_w), device=images.device, dtype=images.dtype
+        )
+
     for start in range(0, b, frames_per_chunk):
         end = min(start + frames_per_chunk, b)
         cropped = images[start:end, y0:y0 + ch, x0:x0 + cw, :]
@@ -666,12 +730,15 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
 
         if cell_method in ("majority", "center_weighted"):
             idx_grid = weighted_vote_reduce(
-                cropped, block, palette, cell_method, pixel_mask=pixel_mask
+                cropped, block, palette, cell_method, pixel_mask=pixel_mask,
+                color_distance=color_distance,
             )
         elif cell_method == "center":
             cy, cx = block // 2, block // 2
             sampled = cropped[:, cy::block, cx::block, :][:, :oh, :ow, :]
-            idx_grid = nearest_palette_index(sampled.reshape(-1, c), palette).reshape(cb, oh, ow)
+            idx_grid = nearest_palette_index(
+                sampled.reshape(-1, c), palette, color_distance=color_distance
+            ).reshape(cb, oh, ow)
             if pixel_mask is not None:
                 center_valid = pixel_mask[:, cy::block, cx::block][:, :oh, :ow]
                 pixels = cropped.reshape(cb, oh, block, ow, block, c).permute(0, 1, 3, 2, 4, 5)
@@ -679,7 +746,9 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
                 valid = pixel_mask_cells
                 mask_f = valid.to(cropped.dtype).unsqueeze(-1)
                 mean = (pixels * mask_f).sum(dim=3) / mask_f.sum(dim=3).clamp(min=1.0)
-                fallback = nearest_palette_index(mean.reshape(-1, c), palette).reshape(cb, oh, ow)
+                fallback = nearest_palette_index(
+                    mean.reshape(-1, c), palette, color_distance=color_distance
+                ).reshape(cb, oh, ow)
                 idx_grid = torch.where(center_valid, idx_grid, fallback)
         else:  # median
             blocks = cropped.reshape(cb, oh, block, ow, block, c).permute(0, 1, 3, 2, 4, 5)
@@ -688,7 +757,9 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
                 down = blocks.median(dim=3).values
             else:
                 down = _masked_median(blocks, pixel_mask_cells)
-            idx_grid = nearest_palette_index(down.reshape(-1, c), palette).reshape(cb, oh, ow)
+            idx_grid = nearest_palette_index(
+                down.reshape(-1, c), palette, color_distance=color_distance
+            ).reshape(cb, oh, ow)
 
         if despeckle:
             idx_grid = despeckle_indices(idx_grid, k)
@@ -706,8 +777,8 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
         mapped = F.interpolate(
             mapped.permute(0, 3, 1, 2), size=(out_h, out_w), mode="nearest"
         ).permute(0, 2, 3, 1)
-        outputs.append(mapped)
-        if return_foreground_mask:
+        result[start:end, ..., :3] = mapped
+        if return_foreground_mask or return_rgba:
             if foreground_cells is None:
                 opaque = torch.ones(
                     (cb, oh, ow), device=images.device, dtype=images.dtype
@@ -717,11 +788,15 @@ def process_batch(images: torch.Tensor, block: int, phase_y: int, phase_x: int, 
             opaque = F.interpolate(
                 opaque.unsqueeze(1), size=(out_h, out_w), mode="nearest"
             ).squeeze(1)
-            foreground_outputs.append(opaque)
+            if return_rgba:
+                result[start:end, ..., 3] = opaque
+            else:
+                foreground_result[start:end] = opaque
 
-    result = torch.cat(outputs, dim=0)
+    if return_rgba and return_foreground_mask:
+        return result, result[..., 3]
     if return_foreground_mask:
-        return result, torch.cat(foreground_outputs, dim=0)
+        return result, foreground_result
     return result
 
 
@@ -799,9 +874,16 @@ class VideoPixelSnapper:
                                                           "BiRefNet/RMBG normally uses white as foreground."}),
                 "background_mode": (["solid", "transparent"], {
                     "default": "solid",
-                    "tooltip": "solid preserves the existing RGB working background. transparent "
-                               "uses a unique invisible RGB key plus hard cell alpha; connect "
-                               "transparent_image to the alpha-aware pipeline. Requires foreground_mask."
+                    "tooltip": "solid preserves existing sizing/background behavior. transparent "
+                               "uses a unique invisible key plus hard alpha and forces scale=1 "
+                               "to avoid multi-gigabyte RGBA batches; upscale only after retiming/sheet. "
+                               "Requires foreground_mask."
+                }),
+                "color_distance": (["oklab", "rgb_legacy"], {
+                    "default": "oklab",
+                    "tooltip": "oklab chooses the palette color that looks perceptually closest "
+                               "and protects hue (recommended). rgb_legacy uses raw RGB distance "
+                               "and can map orange to salmon or gray to a saturated hue."
                 }),
             },
             "optional": {
@@ -822,8 +904,12 @@ class VideoPixelSnapper:
     def run(self, image, pixel_size, grid_detection_mode, cell_method, k_colors, accent_slots,
             sample_frames, dither, despeckle, output_scale_mode, output_scale, seed,
             mask_threshold=0.5, mask_cell_threshold=0.25, invert_mask=False,
-            background_mode="solid", custom_palette=None, foreground_mask=None,
-            background_image=None):
+            background_mode="solid", color_distance="oklab", custom_palette=None,
+            foreground_mask=None, background_image=None):
+        embedded_alpha = (
+            image[..., 3].float().clamp(0.0, 1.0)
+            if image.shape[-1] > 3 else None
+        )
         image = _drop_alpha(image)
         if custom_palette is not None:
             custom_palette = _drop_alpha(custom_palette)
@@ -834,15 +920,25 @@ class VideoPixelSnapper:
         mask_threshold = float(max(0.0, min(1.0, mask_threshold)))
         mask_cell_threshold = float(max(0.0, min(1.0, mask_cell_threshold)))
         prepared_mask = None
+        mask_source = "none"
         if foreground_mask is not None:
             prepared_mask = _prepare_mask(
                 foreground_mask, b, h, w, device, invert=bool(invert_mask)
             )
+            mask_source = "connected"
+        elif embedded_alpha is not None and bool((embedded_alpha < 1.0 - 1e-6).any()):
+            # IMAGE tensors produced by alpha-aware nodes may carry RGBA even
+            # though ComfyUI's standard Load Image splits PNG alpha into a
+            # separate MASK. Honor genuine embedded alpha automatically and
+            # keep its hidden RGB out of palette/cell statistics.
+            prepared_mask = embedded_alpha.to(device=device, dtype=torch.float32)
+            mask_source = "embedded_alpha"
         transparent_mode = background_mode == "transparent"
         if transparent_mode and prepared_mask is None:
             raise ValueError(
-                "background_mode='transparent' requires foreground_mask from "
-                "BiRefNet/RMBG so hard alpha can be defined"
+                "background_mode='transparent' requires foreground_mask or "
+                "an RGBA IMAGE with embedded alpha. Standard Load Image emits "
+                "RGB + a separate MASK, so connect that MASK and enable invert_mask."
             )
 
         n_samples = min(sample_frames, b)
@@ -952,18 +1048,27 @@ class VideoPixelSnapper:
         # --- output size ---
         oh = (h - phase_y % block) // block
         ow = (w - phase_x % block) // block
-        out_h, out_w, resolved_scale = resolve_output_size(oh, ow, h, w, output_scale_mode, output_scale)
+        out_h, out_w, resolved_scale = resolve_output_size(
+            oh, ow, h, w, output_scale_mode, output_scale
+        )
+        transparent_scale_note = ""
+        if transparent_mode and (out_h != oh or out_w != ow):
+            requested = f"{out_w}x{out_h}"
+            out_h, out_w, resolved_scale = oh, ow, 1
+            transparent_scale_note = (
+                f" transparent_scale=forced_1x(requested={requested})"
+            )
 
         # --- apply ---
-        out, foreground_alpha = process_batch(
+        transparent_image, foreground_alpha = process_batch(
             image, block, phase_y, phase_x, palette, cell_method, dither,
             despeckle, out_h, out_w, foreground_mask=prepared_mask,
             mask_threshold=mask_threshold, mask_cell_threshold=mask_cell_threshold,
             background_index=background_index, return_foreground_mask=True,
+            return_rgba=True, color_distance=color_distance,
         )
-        transparent_image = torch.cat(
-            [out, foreground_alpha.unsqueeze(-1)], dim=-1
-        )
+        # RGB compatibility output is a zero-copy view of the RGBA tensor.
+        out = transparent_image[..., :3]
         transparency_mask = 1.0 - foreground_alpha
         preview = make_palette_preview(palette)
         mask_info = ""
@@ -971,33 +1076,118 @@ class VideoPixelSnapper:
             bg8 = (background_rgb.clamp(0.0, 1.0) * 255).round().long().tolist()
             mask_info = (
                 f" mask=on bg=#{bg8[0]:02x}{bg8[1]:02x}{bg8[2]:02x} "
+                f"mask_source={mask_source} "
                 f"background_mode={background_mode} mask_threshold={mask_threshold:g} "
                 f"cell_threshold={mask_cell_threshold:g}"
             )
         info = (f"grid={block}px phase=({phase_x},{phase_y}) cells={ow}x{oh} "
                 f"source={w}x{h} palette={palette_source} "
-                f"scale={resolved_scale}x -> {out_w}x{out_h}{mask_info}")
+                f"color_distance={color_distance} "
+                f"scale={resolved_scale}x -> {out_w}x{out_h}{mask_info}"
+                f"{transparent_scale_note}")
 
         return (out, preview, info, transparent_image, transparency_mask)
+
+
+def _preview_fingerprint(image: torch.Tensor) -> str:
+    """FNV-1a of the exact RGBA bytes a browser canvas sees.
+
+    Preview PNG export truncates float channels to uint8. Canvas APIs canonicalize
+    fully transparent RGB to zero, so do the same before hashing. The commit is
+    thereby tied to the original still without being invalidated when the user
+    reloads an edited palette through the upstream snapper.
+    """
+    q = (image.clamp(0.0, 1.0).detach().cpu() * 255.0).to(torch.uint8)
+    if q.shape[-1] == 3:
+        alpha = torch.full((*q.shape[:-1], 1), 255, dtype=torch.uint8)
+        q = torch.cat((q, alpha), dim=-1)
+    else:
+        q = q[..., :4].clone()
+        transparent = q[..., 3] == 0
+        q[..., :3][transparent] = 0
+    value = 2166136261
+    for byte in q.contiguous().numpy().tobytes():
+        value ^= byte
+        value = (value * 16777619) & 0xFFFFFFFF
+    return f"{value:08x}"
+
+
+def _decode_committed_live_png(payload_text, original_preview, snapped_shape,
+                               device, dtype):
+    """Decode a browser-committed exact Live frame and validate its source."""
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Live Editor committed_live_png is invalid JSON; clear and recommit") from exc
+    if not isinstance(payload, dict) or int(payload.get("version", 0)) != 1:
+        raise ValueError("Live Editor commit version is unsupported; clear and recommit")
+    if int(payload.get("batch", 1)) != 1 or int(snapped_shape[0]) != 1:
+        raise ValueError(
+            "Exact Live commit currently supports one still image only. "
+            "Provide a one-image batch or clear the commit."
+        )
+    expected_h, expected_w = int(snapped_shape[1]), int(snapped_shape[2])
+    if int(payload.get("width", -1)) != expected_w or int(payload.get("height", -1)) != expected_h:
+        raise ValueError(
+            f"Committed Live size {payload.get('width')}x{payload.get('height')} "
+            f"does not match current output {expected_w}x{expected_h}; clear and recommit"
+        )
+    raw_h, raw_w = int(original_preview.shape[1]), int(original_preview.shape[2])
+    payload_raw_w = payload.get("raw_width")
+    payload_raw_h = payload.get("raw_height")
+    if payload_raw_w is not None and payload_raw_h is not None:
+        if int(payload_raw_w) != raw_w or int(payload_raw_h) != raw_h:
+            raise ValueError(
+                f"Committed Live Original size {payload_raw_w}x{payload_raw_h} "
+                f"does not match current Original {raw_w}x{raw_h}; clear and recommit"
+            )
+    expected_hash = _preview_fingerprint(original_preview)
+    # Browser Canvas round-trips semi-transparent RGB through premultiplied
+    # alpha and may change a few hidden/edge bytes. An exact FNV mismatch is
+    # therefore diagnostic, not proof that the user selected another image.
+    # Dimensions and PNG integrity remain hard gates; never crash/reject a
+    # deliberate commit solely because browser and Torch hashes differ.
+    fingerprint_status = (
+        "match" if payload.get("raw_hash") == expected_hash
+        else "mismatch_accepted(canvas_alpha_roundtrip)"
+    )
+    data_url = payload.get("png", "")
+    if not isinstance(data_url, str) or "," not in data_url:
+        raise ValueError("Committed Live PNG payload is missing; clear and recommit")
+    try:
+        encoded = data_url.split(",", 1)[1]
+        binary = base64.b64decode(encoded, validate=True)
+        from PIL import Image as PILImage
+        import numpy as np
+        with PILImage.open(io.BytesIO(binary)) as image:
+            rgba_u8 = np.array(image.convert("RGBA"), dtype=np.uint8, copy=True)
+    except Exception as exc:
+        raise ValueError("Committed Live PNG could not be decoded; clear and recommit") from exc
+    if rgba_u8.shape[:2] != (expected_h, expected_w):
+        raise ValueError("Decoded committed Live dimensions changed; clear and recommit")
+    rgba = torch.from_numpy(rgba_u8).to(device=device, dtype=dtype) / 255.0
+    return rgba.unsqueeze(0), fingerprint_status
 
 
 class VideoPixelSnapperEditor:
     """
     Optional companion node: hosts the in-graph live palette editor
     widget (web/video_pixel_snapper.js). Kept separate from the core
-    VideoPixelSnapper node on purpose — it does no image processing of
-    its own, only saves preview frames for the widget to fetch, so
-    adding the (fairly large) editor UI to your graph is opt-in and
-    doesn't bloat or slow down the core node when you don't need it.
+    VideoPixelSnapper node on purpose: ordinary execution is a lightweight
+    pass-through plus preview export. For a single still, the explicit Commit
+    Live action can instead decode the exact browser canvas onto this node's
+    outputs. The large editor UI remains opt-in and never bloats the core node.
 
     Wire it up from the core node: `image` -> original_image,
     the core node's `image` output -> snapped_image, and its
-    `palette_preview` output -> palette_preview.
+    `palette_preview` output -> palette_preview. When a discrete post-process
+    such as Selective Outline sits in between, feed its final image to
+    snapped_image and its changed_outline diagnostic to postprocess_mask.
     """
 
     CATEGORY = "Video Pixel Snapper"
-    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK")
-    RETURN_NAMES = ("image", "transparent_image", "transparency_mask")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "transparent_image", "transparency_mask", "commit_info")
     FUNCTION = "run"
 
     @classmethod
@@ -1013,6 +1203,12 @@ class VideoPixelSnapperEditor:
                                                             "widget can page through. Each one is written as a "
                                                             "PNG file for the browser to fetch, so pushing this "
                                                             "very high on a big batch costs real disk/time."}),
+                "committed_live_png": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Written by the Commit Live button for exact single-image output. "
+                               "Contains the visible Live canvas as a PNG data payload; do not edit manually."
+                }),
             },
             "optional": {
                 "info": ("STRING", {"forceInput": True,
@@ -1020,15 +1216,67 @@ class VideoPixelSnapperEditor:
                                                  "output here. Lets Live use the exact grid size, phase, cell "
                                                  "dimensions, and output scale. Without it, Live falls back to "
                                                  "a centered best-effort reduction."}),
+                "postprocess_mask": ("MASK", {
+                    "tooltip": "Optional: connect Selective Outline / Sel-Out's `changed_outline`. "
+                               "After a palette edit, Live reclassifies ordinary cells from RAW but "
+                               "reclassifies these masked cells from the authoritative post-processed "
+                               "Snapped image, preserving the Sel-Out structure in the preview."
+                }),
+                "original_transparency_mask": ("MASK", {
+                    "tooltip": "Optional ComfyUI transparency mask for original_image (white = transparent). "
+                               "Connect Load Image's MASK when the source PNG has alpha; ComfyUI separates "
+                               "that alpha from its RGB IMAGE output. This affects the Original browser "
+                               "preview only, not processing."
+                }),
             },
         }
 
-    def run(self, original_image, snapped_image, palette_preview, max_preview_frames, info=""):
-        snapped_alpha = (
-            snapped_image[..., 3].float().clamp(0.0, 1.0)
-            if snapped_image.shape[-1] > 3 else None
+    def run(
+        self, original_image, snapped_image, palette_preview,
+        max_preview_frames, info="", postprocess_mask=None,
+        original_transparency_mask=None, committed_live_png="",
+    ):
+        snapped_batch, snapped_h, snapped_w = snapped_image.shape[:3]
+        prepared_postprocess_mask = None
+        if postprocess_mask is not None:
+            prepared_postprocess_mask = _prepare_mask(
+                postprocess_mask, snapped_batch, snapped_h, snapped_w,
+                snapped_image.device,
+            )
+            # The mask is a diagnostic/selector, not soft alpha. Store exact
+            # changed/not-changed cells so browser resizing cannot invent a
+            # fringe around the post-process region.
+            prepared_postprocess_mask = (
+                prepared_postprocess_mask >= 0.5
+            ).to(dtype=torch.float32)
+
+        original_batch, original_h, original_w = original_image.shape[:3]
+        original_rgba_input = (
+            original_image[..., :4] if original_image.shape[-1] > 3 else None
         )
-        original_image = _drop_alpha(original_image)
+        original_rgb = _drop_alpha(original_image)
+        if original_transparency_mask is not None:
+            # ComfyUI Load Image convention: MASK=1 means transparent. Invert
+            # to conventional alpha for an honest browser preview.
+            original_alpha = _prepare_mask(
+                original_transparency_mask, original_batch, original_h,
+                original_w, original_image.device, invert=True,
+            ).to(dtype=original_rgb.dtype)
+            original_preview = torch.cat(
+                [original_rgb, original_alpha.unsqueeze(-1)], dim=-1
+            )
+        elif original_rgba_input is not None:
+            original_preview = original_rgba_input
+        else:
+            original_preview = original_rgb
+
+        snapped_rgba_input = (
+            snapped_image[..., :4] if snapped_image.shape[-1] > 3 else None
+        )
+        snapped_alpha = (
+            snapped_rgba_input[..., 3] if snapped_rgba_input is not None else None
+        )
+        original_image = original_rgb
         snapped_image = _drop_alpha(snapped_image)
         palette_preview = _drop_alpha(palette_preview)
         if snapped_alpha is None:
@@ -1043,14 +1291,56 @@ class VideoPixelSnapperEditor:
                     snapped_image.shape[:3], device=snapped_image.device,
                     dtype=snapped_image.dtype,
                 )
-        transparent_image = torch.cat(
-            [snapped_image, snapped_alpha.unsqueeze(-1)], dim=-1
-        )
+        if snapped_rgba_input is not None:
+            # Preserve the incoming RGBA storage; do not allocate a second
+            # full-size four-channel batch merely for the appended output.
+            transparent_image = snapped_rgba_input
+        else:
+            transparent_image = torch.cat(
+                [snapped_image, snapped_alpha.unsqueeze(-1)], dim=-1
+            )
         transparency_mask = 1.0 - snapped_alpha
+        commit_applied = False
+        commit_info = "Live Editor output: pass-through Snapped (no committed Live frame)"
+        if committed_live_png:
+            try:
+                committed_rgba, fingerprint_status = _decode_committed_live_png(
+                    committed_live_png, original_preview, snapped_image.shape,
+                    snapped_image.device, snapped_image.dtype,
+                )
+                transparent_image = committed_rgba
+                snapped_image = transparent_image[..., :3]
+                snapped_alpha = transparent_image[..., 3]
+                transparency_mask = 1.0 - snapped_alpha
+                commit_applied = True
+                commit_info = (
+                    f"Live Editor output: exact committed browser Live PNG "
+                    f"{snapped_image.shape[2]}x{snapped_image.shape[1]} RGBA "
+                    f"fingerprint={fingerprint_status}"
+                )
+            except ValueError as exc:
+                # A stale/corrupt hidden payload must not crash the complete
+                # workflow. Keep the authoritative Snapped input and expose a
+                # clear diagnostic so the user can Clear/Recommit.
+                commit_info = (
+                    f"Live Editor output: commit rejected, pass-through Snapped; {exc}"
+                )
+                print(f"[VideoPixelSnapper] {commit_info}")
 
-        raw_refs = _save_preview_images(original_image, "VPS_raw", max_frames=max_preview_frames)
-        frame_refs = _save_preview_images(snapped_image, "VPS_frame", max_frames=max_preview_frames)
+        raw_refs = _save_preview_images(original_preview, "VPS_raw", max_frames=max_preview_frames)
+        # Use the actual alpha-aware result for browser previews. Previous
+        # versions saved only snapped RGB here, exposing the otherwise hidden
+        # background key/color and making transparency look "restored".
+        frame_refs = _save_preview_images(
+            transparent_image, "VPS_frame", max_frames=max_preview_frames
+        )
         palette_refs = _save_preview_images(palette_preview, "VPS_palette", max_frames=1)
+        postprocess_refs = []
+        if prepared_postprocess_mask is not None:
+            postprocess_rgb = prepared_postprocess_mask.unsqueeze(-1).expand(-1, -1, -1, 3)
+            postprocess_refs = _save_preview_images(
+                postprocess_rgb, "VPS_postprocess", max_frames=max_preview_frames
+            )
 
         grid = None
         if info:
@@ -1074,16 +1364,33 @@ class VideoPixelSnapperEditor:
                 if m:
                     grid = [int(v) for v in m.groups()]
 
-        ui_data = {"vps_raw": raw_refs, "vps_frames": frame_refs, "vps_palette": palette_refs}
+        ui_data = {
+            "vps_raw": raw_refs,
+            "vps_frames": frame_refs,
+            "vps_palette": palette_refs,
+            "vps_total_frames": [snapped_batch],
+            "vps_commit_active": [commit_applied],
+            "vps_commit_info": [commit_info],
+        }
+        if prepared_postprocess_mask is not None:
+            ui_data["vps_postprocess_masks"] = postprocess_refs
+            ui_data["vps_postprocess_active"] = [True]
         if grid:
             ui_data["vps_grid"] = grid
         if info:
             bg_match = re.search(r"mask=on bg=(#[0-9a-fA-F]{6})", info)
             if bg_match:
                 ui_data["vps_background"] = [bg_match.group(1).lower()]
+            distance_match = re.search(
+                r"color_distance=(oklab|rgb_legacy)", info
+            )
+            if distance_match:
+                ui_data["vps_color_distance"] = [distance_match.group(1)]
         return {
             "ui": ui_data,
-            "result": (snapped_image, transparent_image, transparency_mask),
+            "result": (
+                snapped_image, transparent_image, transparency_mask, commit_info
+            ),
         }
 
 

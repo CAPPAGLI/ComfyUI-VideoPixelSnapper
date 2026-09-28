@@ -1,6 +1,348 @@
 # Changelog
 
-## 2.0.0 — 2026-08-17
+## 2.6.2 — 2026-08-30
+
+### RGBA Loader appears on ComfyUI 0.33.x
+
+- Fixed `Load RGBA Image` being absent from the Add Node menu even though the
+  package registered nine class mappings. Its `INPUT_TYPES` called
+  `folder_paths.get_input_files()`, which is not available in the user's
+  ComfyUI 0.33.1 build; object-info generation therefore skipped that one node.
+- Replaced the version-dependent call with recursive enumeration rooted at the
+  stable `folder_paths.get_input_directory()` API. PNG, JPEG, WebP, BMP, GIF,
+  and TIFF files are listed with input-relative forward-slash paths.
+- Added a recursive-listing regression. All 69 tests pass; canonical-folder
+  extracted import, nine-node registration, ES-module validation, and Live
+  Editor DOM lifecycle smoke pass.
+
+## 2.6.1 — 2026-08-30
+
+### Canonical install folder and registration diagnostic
+
+- Release ZIP now uses the canonical top-level folder
+  `ComfyUI-Video-Pixel-Snapper`, matching the user's existing installation and
+  preventing an old eight-node folder from being loaded instead of—or after—a
+  separately extracted `ComfyUI-VideoPixelSnapper` folder.
+- Startup now prints
+  `[VideoPixelSnapper] v2.6.1 loaded: 9 nodes (RGBA loader=yes)`, providing an
+  immediate authoritative registration check in ComfyUI logs.
+- No processing behavior changed from v2.6.0. All 68 tests, nine-node extracted
+  import, ES-module validation, and Live Editor DOM lifecycle smoke pass.
+
+## 2.6.0 — 2026-08-30
+
+### Alpha-aware still-image workflow
+
+- Added the ninth focused node, `Load RGBA Image`, because standard ComfyUI
+  `Load Image` deliberately separates PNG alpha into a MASK and returns RGB on
+  its IMAGE socket. The new loader emits true RGBA, foreground/transparency
+  masks, and RGB compatibility output.
+- `sanitize_hidden_rgb=true` canonicalizes RGB to black only where alpha is
+  exactly zero. The supplied `captain.png` contains 220,787 alpha-zero pixels
+  with 13,202 hidden RGB variants—including large white and magenta regions—so
+  Photoshop selection/mask and eraser operations looked different whenever
+  alpha was dropped. Visible and partial-alpha pixels are untouched.
+- Video Pixel Snapper Core now automatically uses nontrivial embedded RGBA
+  alpha when no explicit `foreground_mask` is connected. Hidden transparent RGB
+  is excluded from palette/cell statistics; `background_mode=transparent`
+  accepts embedded alpha and reports `mask_source=embedded_alpha`.
+- Palette Coverage Analyzer likewise uses embedded alpha automatically.
+- Live Editor's RAW median reducer now excludes source samples with alpha below
+  0.5, preventing invisible white/magenta Photoshop mattes from receiving or
+  influencing visible palette colors.
+- Fully opaque RGBA remains on the unmasked path, preserving prior behavior.
+  Standard Load Image still requires its MASK connection because alpha is no
+  longer present in its RGB IMAGE tensor; this cannot be inferred downstream.
+- Added embedded-alpha Core/Analyzer, alpha-aware browser median, and RGBA-loader
+  sanitization/preservation regressions. All 68 tests pass; ES-module and DOM
+  lifecycle validation pass.
+
+## 2.5.2 — 2026-08-30
+
+### Commit fingerprint no longer crashes or rejects a valid browser canvas
+
+- Fixed `Committed Live belongs to a different Original image` immediately
+  after Commit. Browser Canvas can round RGB at soft/transparent edges through
+  premultiplied-alpha conversion, so its exact byte FNV is not guaranteed to
+  match the original Torch tensor even when the image is the same.
+- Fingerprint mismatch is now diagnostic (`mismatch_accepted`) rather than a
+  hard rejection. Output dimensions, single-image batch, Original dimensions
+  for new commits, PNG structure, and decoded output dimensions remain hard
+  integrity checks.
+- Any malformed, stale-size, or otherwise invalid hidden commit now fails soft:
+  Live Editor passes through the authoritative Snapped input and reports
+  `commit rejected` through `commit_info`/the browser status instead of crashing
+  the complete workflow.
+- New commit payloads include Original width/height as a stable source guard.
+  Existing v2.5.1 payloads remain accepted.
+- Added regressions for the reported browser/Torch fingerprint mismatch and for
+  corrupt-commit fail-soft behavior. All 63 tests pass; ES-module syntax and
+  jsdom widget lifecycle validation pass.
+
+## 2.5.1 — 2026-08-30
+
+### Live Editor frontend load repair
+
+- Fixed the actual reason the v2.5.0 Live Editor UI disappeared: four stray
+  closing lines remained at the end of `web/video_pixel_snapper.js`, so the
+  browser rejected the entire ES module before `registerExtension` ran. Python
+  still loaded and displayed `committed_live_png`, which made the failure look
+  like a widget/layout problem.
+- Corrected the validation gap: `node --check file.js` used the local CommonJS
+  package default and returned success for this file, while the browser parses
+  Comfy extensions as ES modules. The automated suite now copies the frontend
+  to a `.mjs` path and checks the actual ES-module grammar.
+- Converted remaining UI punctuation to ASCII to avoid misleading mojibake when
+  Windows/Comfy serves the JavaScript source without an explicit UTF-8 charset.
+- Added an external jsdom lifecycle smoke test during release validation: the
+  module registers, `onNodeCreated` completes, the DOM widget attaches, the
+  Commit button exists, and the hidden commit-state widget is hidden.
+- All 62 automated tests pass, including the new ES-module syntax regression.
+
+## 2.5.0 — 2026-08-30
+
+### Exact Live image commit for single stills
+
+- Added **Commit Live → output** to the Live Editor. A palette PNG stores only a
+  list of colors, not the per-cell assignments visible in the browser. Reloading
+  that palette into Core therefore legitimately re-ran Core's majority logic
+  and could not reproduce Live's separate RAW-median approximation.
+- Commit captures the exact visible Live RGBA canvas at the authoritative
+  Snapped output dimensions with nearest-neighbor scaling, stores it in the
+  hidden serialized `committed_live_png` widget, and materializes that PNG on
+  Live Editor's existing `image`, `transparent_image`, and `transparency_mask`
+  outputs after the next Queue.
+- Added `Clear commit`; any subsequent Add/Delete/Replace/Reset/substitution
+  action invalidates the old commit so stale pixels cannot silently survive a
+  later palette edit.
+- Commits are restricted to one-image batches, matching the requested still
+  workflow. A source fingerprint lets a committed look survive upstream palette
+  reloads while rejecting reuse on a different Original image; dimensions and
+  payload integrity are validated server-side.
+- Appended `commit_info` after the three existing outputs. Existing RGB/RGBA/mask
+  output positions remain unchanged.
+- Palette-save messaging now explains that saving colors alone cannot preserve
+  Live pixel assignments and points to Commit Live for exact output.
+- Added exact PNG materialization and stale-source rejection regressions. All 61
+  Python tests pass; frontend JavaScript syntax validation passes.
+
+## 2.4.3 — 2026-08-30
+
+### Honest alpha in Live Editor previews
+
+- Fixed a misleading Live Editor preview path that saved only RGB even when
+  `snapped_image` was RGBA. Transparent pixels retain hidden RGB by design;
+  dropping alpha therefore made the removed background/key look restored in
+  Snapped and edited Live panels.
+- Snapped browser previews now use the actual `transparent_image` RGBA tensor.
+  Edited Live previews copy authoritative cell alpha after RAW palette
+  reclassification and Sel-Out post-process-mask overlay.
+- Added optional `original_transparency_mask` to Live Editor. Connect standard
+  Load Image's MASK (white means transparent) to reconstruct honest RGBA for
+  the Original panel; ComfyUI normally separates alpha from its RGB IMAGE.
+- Added checkerboards behind all three canvases and renamed the middle panel to
+  `Snapped / processed`, making both real transparency and a downstream Sel-Out
+  stage explicit.
+- Pick/Delete/Replace now ignore alpha-zero preview pixels instead of treating
+  their invisible RGB payload as a visible palette color.
+- Existing append-only output contract is unchanged: `image` remains RGB for
+  compatibility and cannot contain transparency; use `transparent_image` for
+  alpha-aware saving/downstream nodes.
+- Added regressions for RGBA preview payload preservation, reconstruction of
+  Original alpha from a Comfy transparency mask, and RGB Snapped alpha recovery
+  from the core background metadata used by the reported workflow. All 59
+  Python tests pass; frontend JavaScript syntax validation passes.
+
+## 2.4.2 — 2026-08-30
+
+### Scale-aware Sel-Out
+
+- Fixed Selective Outline on `Video Pixel Snapper.output_scale > 1`. The old
+  raster-space detector saw an enlarged logical outline cell as a thick line
+  and recolored only its outermost one-pixel row.
+- Added `input_pixel_scale`: `0` reads the exact scale and cell/output
+  dimensions from optional `snapper_info`; positive values provide a manual
+  override when info is unavailable.
+- Scaled input is collapsed to the logical pixel grid, processed once there,
+  and restored by exact nearest-neighbor repetition. RGB, RGBA, alpha, and
+  `changed_outline` keep the original output dimensions, with complete N×N
+  logical cells changed together.
+- Added strict validation that a declared scaled input is an exact
+  nearest-neighbor enlargement, with only a one-level encoded PNG tolerance.
+  Bilinear/antialiased or incorrectly declared inputs fail clearly instead of
+  being silently damaged.
+- Added four regressions proving scaled RGBA and RGB+mask output are
+  bit-identical to native-Sel-Out-then-nearest, `snapper_info` scale parsing
+  works, and invalid non-nearest input is rejected. All 57 tests pass.
+
+## 2.4.1 — 2026-08-30
+
+### Live Editor preserves Sel-Out after palette edits
+
+- Added the optional Live Editor `postprocess_mask` input. Connect Selective
+  Outline / Sel-Out's `changed_outline` while feeding the Sel-Out RGB/RGBA
+  result to `snapped_image`.
+- The unedited Live baseline still reuses the authoritative Snapped image
+  exactly. After Add/Delete/Replace, ordinary cells continue to reclassify
+  from pre-snap RAW so newly added colors can appear; mask-selected cells now
+  reclassify from the authoritative post-processed image, preserving Sel-Out
+  geometry instead of reverting those pixels to the raw black outline.
+- Post-processed pixels are remapped through the edited palette rather than
+  copied verbatim, so removed/replaced colors cannot remain hidden in the Live
+  preview. The final Python result after graph re-execution remains
+  authoritative because the browser does not duplicate Sel-Out's full local
+  material/light solver.
+- Hard-thresholded post-process masks are saved with the preview payload and
+  reduced to cell resolution with nearest sampling only.
+- Added a regression for mask normalization, preview payload registration, and
+  unchanged RGBA pass-through. All 53 Python tests pass; frontend JavaScript
+  syntax validation passes.
+
+## 2.4.0 — 2026-08-30
+
+### Palette-locked selective outlining for still images
+
+- Added the eighth focused node, `Selective Outline / Sel-Out`, for replacing
+  black sprite linework with darker material-related entries from a connected
+  palette. Replacements are exact palette colors; no RGB interpolation or new
+  shade synthesis is performed.
+- Added `outer_only` and `outer_and_internal` scope modes. The conservative
+  default changes only one-pixel silhouette boundary cells, while the opt-in
+  mode also handles thin internal black lines.
+- Added deterministic eight-way manual lighting and an optional per-still auto
+  heuristic based on the bright-material centroid. Auto direction and
+  confidence are reported in `info`; manual remains the predictable production
+  choice.
+- Added `subtle`, `balanced`, and `strong` style presets instead of exposing
+  low-level Oklab target parameters.
+- Added exact/near-black threshold control, including support for deliberate
+  dark master entries such as `#181425`.
+- Added RGB, RGBA, white-foreground mask, and Comfy white-transparency mask
+  handling. Detection prefers a connected mask, then RGBA alpha, then a
+  conservative flat-border RGB flood fill. Input alpha is preserved and RGB
+  fallback never silently removes the solid background.
+- Added RGB, RGBA, exact changed-outline MASK, and diagnostic outputs.
+- Added seven regressions for external/internal scope, palette-only replacement,
+  manual/automatic lighting, both mask conventions, hard mask-derived alpha,
+  solid-background fallback, RGBA preservation, and dark non-outline
+  protection. All 52 tests pass.
+
+## 2.3.1 — 2026-08-30
+
+### Missing-cluster percentage correction
+
+- Fixed `(% cells)` coverage in missing-color suggestions. It previously counted
+  every observed cell that a suggestion represented better than master,
+  including already-covered cells below `missing_threshold`; totals could
+  therefore exceed the reported `gap_cells` share.
+- Suggestion coverage now counts only the original threshold-qualified gap
+  cells after near-match and near-black suppression. Cluster percentages are
+  mutually assigned and their total cannot exceed gap share.
+- Extended the lavender/background regression to enforce that invariant. All
+  45 automated tests pass.
+
+## 2.3.0 — 2026-08-30
+
+### Standalone palette analysis
+
+- Palette Coverage Analyzer no longer requires Video Pixel Snapper. New
+  `analysis_pixel_size` uses a manually measured source block size, or `0` to
+  auto-detect size across sampled renders; shared grid phase is estimated from
+  the same batch.
+- Added standalone `mask_threshold` and `mask_cell_threshold` controls. When a
+  compatible optional `snapper_info` is connected, its exact grid and mask
+  thresholds still take precedence for pipeline comparison.
+- Reports now identify `grid_source=snapper_info`, `standalone_manual`,
+  `standalone_auto`, or `standalone_auto_fallback_1` explicitly.
+- Added a regression proving a manual two-pixel grid produces exact standalone
+  cell analysis with no Pixel Snapper node. 45 automated tests pass.
+
+## 2.2.1 — 2026-08-30
+
+### Dark-residue coverage correction
+
+- Near-black resize/compression residues such as `#040307` were sometimes
+  reported as major missing colors even when exact `#000000` existed. Oklab is
+  intentionally sensitive near black, while these few-level encoded-RGB
+  differences are not useful new palette slots.
+- Coverage error and missing suggestions now treat a cell as already covered
+  when it lies within 16/255 Euclidean RGB distance of *any* master entry,
+  regardless of which dark entry Oklab ranks first. If exact black exists,
+  sub-24/255 near-black residues are also suppressed.
+- Added a regression proving near-black residue produces zero gap share and no
+  missing-color suggestion. 44 automated tests pass.
+
+## 2.2.0 — 2026-08-30
+
+### Palette Coverage Analyzer
+
+- Added a seventh focused node, `Palette Coverage Analyzer`, for measuring a
+  fixed game palette against original/pre-snap character frames in Oklab.
+- When core `snapper_info` is connected, analysis uses the exact block size,
+  phase, crop, mask threshold, and cell threshold rather than raw source pixels.
+- `error_heatmap` visualizes cell coverage from blue (close) through green to
+  red (at/above `heatmap_limit`); masked background is black.
+- `suggested_subpalette` is selected only from existing master colors with a
+  weighted greedy coverage objective. It never expands or silently changes the
+  master palette and retains the master's semantic swatch order.
+- `missing_color_suggestions` contains observed 8-bit cell colors representing
+  genuine Oklab gaps. Suggestions are clustered by residual coverage, reported
+  for human review, and never fed back automatically.
+- The report includes mean/median/p95/max error, foreground gap-cell share,
+  suggested color coverage and nearest master entries, plus near-duplicate
+  master pairs below a configurable threshold.
+- Each sampled frame receives equal total statistical weight, preventing a
+  larger silhouette or one long frame sequence from dominating suggestions.
+- Full error-map nearest-color measurement is spatially chunked to avoid large
+  source-cell × palette distance allocations.
+- Added regressions for the supplied light-lavender gap, background exclusion,
+  master-only subpalette selection, and near-duplicate reporting. 43 automated
+  tests pass.
+
+## 2.1.0 — 2026-08-23
+
+### Perceptual custom-palette matching
+
+- Added `color_distance=oklab/rgb_legacy` to Video Pixel Snapper, appended after
+  all existing controls. Oklab is the new recommended default.
+- Legacy nearest-color classification used Euclidean encoded-sRGB distance.
+  That metric can prefer a numerically nearby but visibly wrong hue. In the
+  supplied fox screenshot, dominant source orange around `#E4954B` maps to
+  salmon `#EF7D57` in RGB, while Oklab selects the intended orange bridge
+  `#EA8A2E` from the same 59-color palette.
+- Oklab matching is applied consistently to majority/center-weighted source
+  votes, center/median representatives, and ambiguous-cell fallbacks. It still
+  selects an existing palette entry and never synthesizes a color.
+- Live Editor now receives the core distance mode through `info` and uses the
+  same RGB/Oklab metric for both exact and lookup-table edited previews.
+- Custom palette strips preserve first-occurrence swatch/ramp order instead of
+  being lexicographically scrambled by `torch.unique` before Live Editor.
+- Added orange hue-protection, end-to-end metric-selection, metadata, and
+  swatch-order regressions. 41 automated tests pass.
+
+## 2.0.1 — 2026-08-23
+
+### Transparent-output CPU memory fix
+
+- Fixed a multi-gigabyte allocation introduced by v2.0.0 when a large frame
+  batch combined `background_mode=transparent` with an upscaled core output.
+  A reported 7,261,913,088-byte request corresponds exactly to one float32 RGBA
+  tensor shaped `32×2736×5184×4`.
+- Transparent mode now intentionally forces the core output to native cell
+  scale (`scale=1`). Temporal cleanup already requires scale 1, and sprite
+  sheets should be assembled before any final nearest-neighbor presentation
+  upscale. `info` reports the ignored requested dimensions.
+- Core processing now preallocates one final RGBA tensor and exposes the legacy
+  RGB output as a zero-copy view of its first three channels. The previous path
+  first retained a complete RGB batch and then allocated another complete RGBA
+  copy.
+- Long-batch processing writes chunks directly into that final tensor instead
+  of retaining chunk outputs and concatenating them at the end.
+- Live Editor and Frame Retimer reuse incoming RGBA storage rather than creating
+  an unnecessary second four-channel input batch.
+- Added scale-forcing/storage-sharing regressions. 40 automated tests pass.
+
+## 2.0.0 — 2026-08-23
 
 ### Hard-alpha PNG pipeline
 
